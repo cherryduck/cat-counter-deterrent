@@ -205,6 +205,15 @@ class DepthDetector:
                 and b.height_mm <= c.max_height_mm
                 and b.inside_roi >= c.min_inside_roi)
 
+    def is_person(self, b: Blob) -> bool:
+        """Person-like: bigger than any cat, or a sizeable blob reaching the bottom
+        of the image (someone standing at the counter always does)."""
+        if self.is_cat_sized(b):
+            return False
+        H = b.mask.shape[0]
+        x, y, w, h = b.bbox
+        return b.area_m2 > self.cfg.max_area_m2 or (y + h >= H - 2 and b.area_m2 >= self.cfg.person_min_area_m2)
+
     def maybe_absorb(self, depth: np.ndarray, blobs: list[Blob], is_cat: bool,
                      now: float | None = None) -> bool:
         """Absorb a long-static, non-cat object (e.g. a kettle) into the baseline.
@@ -246,59 +255,91 @@ def colorize_depth(depth: np.ndarray, max_mm: int = 4000) -> np.ndarray:
 
 
 class MotionGate:
-    """Is a cat-sized blob *animate*? A cat moves; a kettle that has just been put
-    down does not.
+    """Is a cat-sized blob *animate*? A cat moves or arrives by itself; a bag
+    that a person has just put down does neither.
 
-    Motion is only measured between two frames in which the blob was a standalone
-    candidate (not attached to an arm reaching in from outside the counter), so
-    the hand that placed an object doesn't count as the object moving.
+    A candidate is animate if, compared with the same blob `lag` frames ago, it
+    has moved (centroid shift), changed shape (low mask IoU), or its *interior*
+    depth changed. Edge pixels are excluded: depth noise at object edges is
+    large and made a static bag look like it was moving.
+    Measured on a static bag: shift <= 2.2 px, IoU >= 0.86, interior-change <= 5%.
+
+    It is also animate if it *arrived* (new blob) with no person-sized blob in
+    the scene in the previous `person_window_s` - i.e. a cat jumping up. Things
+    placed by a person are born with a person present, so they don't count.
     """
 
-    def __init__(self, lag: int = 5, motion_mm: float = 40.0, motion_frac: float = 0.12,
-                 centroid_px: float = 8.0, hold_s: float = 2.0, settle_s: float = 1.5):
-        self.lag, self.motion_mm, self.motion_frac = lag, motion_mm, motion_frac
-        self.centroid_px, self.hold_s, self.settle_s = centroid_px, hold_s, settle_s
-        self._person: list[tuple[np.ndarray, float]] = []   # (mask, until): recently touched by a person
+    def __init__(self, lag: int = 5, motion_mm: float = 40.0, interior_frac: float = 0.2,
+                 shift_px: float = 5.0, iou_min: float = 0.7, hold_s: float = 2.0,
+                 settle_s: float = 1.5, person_window_s: float = 2.0):
+        self.lag, self.motion_mm, self.interior_frac = lag, motion_mm, interior_frac
+        self.shift_px, self.iou_min, self.hold_s = shift_px, iou_min, hold_s
+        self.settle_s, self.person_window_s = settle_s, person_window_s
         self.hist: deque[tuple[np.ndarray, list[Blob]]] = deque(maxlen=lag + 1)
         self._moving_until: list[tuple[np.ndarray, float]] = []   # (mask, until)
+        self._person: list[tuple[np.ndarray, float]] = []         # (mask, until): touched by a person
+        self._last_person = -1e9
+        self._tracks: list[dict] = []                              # {mask, last, arrival}
+        self._kernel = np.ones((5, 5), np.uint8)
         self.last_score: float = 0.0
+        self.last_why: str = ""
+
+    def _match(self, b: Blob, others: list[Blob]):
+        prev = [o for o in others if np.count_nonzero(o.mask & b.mask) >= 0.3 * min(o.pixels, b.pixels)]
+        return max(prev, key=lambda o: np.count_nonzero(o.mask & b.mask)) if prev else None
 
     def update(self, depth: np.ndarray, cands: list[Blob], now: float,
                person_masks: list[np.ndarray] = ()) -> list[bool]:
-        """Return, for each candidate, whether it's animate (moved recently).
-
-        person_masks: person-sized blobs this frame. Movement at a spot a person
-        touched within settle_s (e.g. a hand putting a kettle down and pulling
-        away) does not count.
-        """
+        """Return, for each candidate, whether it's animate."""
         self._person = [(m, t) for m, t in self._person if t > now]
         for m in person_masks:
             self._person.append((cv2.dilate(m.astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool),
                                  now + self.settle_s))
+        if person_masks:
+            self._last_person = now
         self.hist.append((depth, cands))
         self._moving_until = [(m, t) for m, t in self._moving_until if t > now]
-        out = []
-        self.last_score = 0.0
+        self._tracks = [t for t in self._tracks if now - t["last"] < 0.5]
         old = self.hist[0] if len(self.hist) > self.lag else None
+        out = []
+        self.last_score, self.last_why = 0.0, ""
         for b in cands:
-            moved = False
-            if old is not None:
+            why = ""
+            # --- arrival: a new blob with no person around = it got there by itself
+            tr = next((t for t in self._tracks
+                       if np.count_nonzero(t["mask"] & b.mask) >= 0.3 * b.pixels), None)
+            if tr is None:
+                tr = {"arrival": now - self._last_person > self.person_window_s, "born": now}
+                self._tracks.append(tr)
+                if tr["arrival"]:
+                    why = "arrived"
+            tr["mask"], tr["last"] = b.mask, now
+            # --- movement vs `lag` frames ago
+            if old is not None and not why:
                 od, oc = old
-                prev = [o for o in oc if np.count_nonzero(o.mask & b.mask) >= 0.3 * min(o.pixels, b.pixels)]
-                if prev:
-                    o = max(prev, key=lambda o: np.count_nonzero(o.mask & b.mask))
-                    region = (b.mask | o.mask) & (depth > 0) & (od > 0)
-                    if region.any():
-                        diff = np.abs(depth[region].astype(np.float32) - od[region].astype(np.float32))
-                        frac = float(np.mean(diff > self.motion_mm))
-                        (cx, cy), (ox, oy) = b.center, o.center
-                        shift = float(np.hypot(cx - ox, cy - oy))
-                        self.last_score = max(self.last_score, frac)
-                        moved = frac >= self.motion_frac or shift >= self.centroid_px
-            if moved and any(np.count_nonzero(m & b.mask) > 0.05 * b.pixels for m, _ in self._person):
-                moved = False   # a person was just here: it's their hand, not the object
-            if moved:
+                o = self._match(b, oc)
+                if o is not None:
+                    inter = np.count_nonzero(o.mask & b.mask)
+                    iou = inter / max(1, np.count_nonzero(o.mask | b.mask))
+                    (cx, cy), (ox, oy) = b.center, o.center
+                    shift = float(np.hypot(cx - ox, cy - oy))
+                    core = cv2.erode((b.mask & o.mask).astype(np.uint8), self._kernel).astype(bool)
+                    core &= (depth > 0) & (od > 0)
+                    frac = (float(np.mean(np.abs(depth[core].astype(np.float32) - od[core]) > self.motion_mm))
+                            if core.any() else 0.0)
+                    self.last_score = max(self.last_score, frac, 1 - iou)
+                    if shift >= self.shift_px:
+                        why = f"shift {shift:.0f}px"
+                    elif iou < self.iou_min:
+                        why = f"shape iou {iou:.2f}"
+                    elif frac >= self.interior_frac:
+                        why = f"interior {frac:.2f}"
+            if why and why != "arrived" and any(np.count_nonzero(m & b.mask) > 0.05 * b.pixels
+                                                 for m, _ in self._person):
+                why = ""   # a person was just here: it's their hand, not the object
+            if why:
                 self._moving_until.append((b.mask, now + self.hold_s))
+                self.last_why = why
             recent = any(np.count_nonzero(m & b.mask) >= 0.3 * b.pixels for m, _ in self._moving_until)
-            out.append(moved or recent)
+            out.append(bool(why) or recent)
         return out
