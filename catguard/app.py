@@ -16,7 +16,7 @@ import numpy as np
 from .capture import open_source
 from .config import Config
 from .decision import Decider
-from .depth import Blob, Calibration, DepthDetector, build_baseline
+from .depth import Blob, Calibration, DepthDetector, MotionGate, build_baseline, build_noise
 from .detector import brightness
 
 log = logging.getLogger("catguard")
@@ -35,13 +35,18 @@ class Verdict:
     absorbed: bool = False
     timings: dict = field(default_factory=dict)
     cat_box: tuple | None = None
+    reason: str = ""
+    snap_rgb: np.ndarray | None = None     # frame the camera detection was made on
+    motion: float = 0.0
 
     def label(self) -> str:
         s = "DARK" if self.dark else "LIT"
         if self.cat_score is not None:
             s += f" cat={self.cat_score:.2f}"
         if self.candidates:
-            s += f" cand={len(self.candidates)}"
+            s += f" cand={len(self.candidates)} mov={self.motion:.2f}"
+        if self.reason:
+            s += f" [{self.reason}]"
         if self.trigger:
             s += " TRIGGER"
         return s
@@ -54,6 +59,8 @@ class Pipeline:
         self._streak = 0
         self.calib = calib
         self.depth = DepthDetector(cfg.depth, calib)
+        dc = cfg.depth
+        self.motion = MotionGate(dc.motion_lag, dc.motion_mm, dc.motion_frac, hold_s=dc.motion_hold_s)
         self.detector = detector
         self.decider = Decider(cfg.decision)
         self.night_mode = cfg.detector.night_mode
@@ -75,74 +82,60 @@ class Pipeline:
     def process(self, ts: float, rgb: np.ndarray, depth: np.ndarray, now: float | None = None) -> Verdict:
         now = ts if now is None else now
         self._n += 1
+        c = self.cfg
         t0 = time.perf_counter()
         blobs = self.depth.detect(depth)
+        fd = self.depth.filtered if self.depth.filtered is not None else depth
         cands = sorted((b for b in blobs if self.depth.is_cat_sized(b)), key=lambda b: -b.pixels)
+        persons = [b.mask for b in blobs if b.area_m2 > c.depth.max_area_m2]
+        animate = self.motion.update(fd, cands, now, persons)
         t1 = time.perf_counter()
         (rx, ry, rw, rh), feet_roi = self._roi()
-        dark = brightness(rgb[ry:ry + rh, rx:rx + rw]) < self.cfg.detector.min_brightness
+        dark = brightness(rgb[ry:ry + rh, rx:rx + rw]) < c.detector.min_brightness
         score = None
-        hit = False
+        reason = ""
         cat_box = None
-        if not dark and self.detector is not None:
-            if cands:
-                hit, score = self.detector.confirm(rgb, cands[0].bbox)
-            every = self.cfg.detector.scan_every
-            if not hit and every > 0:
-                # depth can be blind (sunlight on the counter): scan RGB directly
-                if self.scanner is not None:
-                    self.scanner.submit(rgb, (rx, ry, rw, rh), feet_roi)
-                    self._last_scan = self.scanner.latest()
-                elif self._n % every == 0:
+        snap_rgb = None
+        # 1) depth: a cat-sized thing on the counter that is moving by itself
+        moving = [b for b, a in zip(cands, animate) if a]
+        if moving and (not dark or self.night_mode == "depth_only"):
+            reason = "depth+motion"
+        # 2) camera: YOLO scan of the counter (covers depth blind spots, e.g. sunlight)
+        if not dark and self.detector is not None and c.detector.scan_every > 0:
+            if self.scanner is not None:
+                self.scanner.submit(rgb, (rx, ry, rw, rh), feet_roi)
+                s_hit, score, s_box, s_rgb = self.scanner.latest()
+            else:
+                if self._n % c.detector.scan_every == 0:
                     on, sc, bx = self.detector.scan(rgb, (rx, ry, rw, rh), feet_roi)
                     self._streak = self._streak + 1 if on else 0
-                    d = self.cfg.detector
+                    d = c.detector
                     self._last_scan = (on and (self._streak >= d.scan_confirm or sc >= d.scan_strong_conf),
                                        sc, bx)
-                s_hit, s_score, s_box = self._last_scan
-                score = max(score or 0.0, s_score)
-                if s_hit:
-                    hit, cat_box = True, s_box
-            elif not hit:
-                self._last_scan = (False, 0.0, None)
-        elif cands:
-            if dark:
-                hit = self.night_mode == "depth_only"
-            else:
-                hit = True  # no model available: depth-only
+                s_hit, score, s_box = self._last_scan
+                s_rgb = None
+            if s_hit:
+                cat_box, snap_rgb = s_box, s_rgb
+                reason = reason + "+camera" if reason else "camera"
+        hit = bool(reason)
         t2 = time.perf_counter()
         trig = self.decider.update(hit, now=now)
-        absorbed = self.depth.maybe_absorb(depth, blobs, is_cat=hit or self.decider.present, now=now)
+        absorbed = self.depth.maybe_absorb(fd, blobs, is_cat=hit or self.decider.present or any(animate),
+                                           now=now)
         return Verdict(ts, blobs, cands, dark, score, hit, self.decider.present, trig, absorbed,
-                       {"depth_ms": (t1 - t0) * 1e3, "detect_ms": (t2 - t1) * 1e3}, cat_box)
+                       {"depth_ms": (t1 - t0) * 1e3, "detect_ms": (t2 - t1) * 1e3}, cat_box,
+                       reason, snap_rgb, self.motion.last_score)
 
 
 def load_detector(cfg: Config, live: bool = False):
-    """Return a detector exposing confirm() (fast crop model) and scan() (accurate model)."""
+    """Return the camera cat detector (used for the counter scan)."""
     from .detector import CatDetector
     d = cfg.detector
-    scan_p, conf_p = cfg.path(d.model), cfg.path(d.confirm_model)
-    if not scan_p.exists():
-        log.warning("model %s missing: running depth-only", scan_p)
+    p = cfg.path(d.model)
+    if not p.exists():
+        log.warning("model %s missing: running depth-only", p)
         return None
-    scan = CatDetector(d, scan_p, d.imgsz, threads=d.scan_threads if live else 4,
-                       full_frame_fallback=False)
-    if not conf_p.exists() or conf_p == scan_p:
-        return scan
-    conf = CatDetector(d, conf_p, d.confirm_imgsz, threads=2 if live else 4,
-                       full_frame_fallback=False)
-    return _Combined(conf, scan)
-
-
-class _Combined:
-    def __init__(self, conf, scan):
-        self._conf, self._scan = conf, scan
-
-    def confirm(self, rgb, bbox):
-        return self._conf.confirm(rgb, bbox)
-
-    def scan(self, rgb, region, roi):
-        return self._scan.scan(rgb, region, roi)
+    return CatDetector(d, p, d.imgsz, threads=d.scan_threads if live else 4, full_frame_fallback=False)
 
 
 def calibrate_frames(frames_iter, n: int):
@@ -154,7 +147,7 @@ def calibrate_frames(frames_iter, n: int):
             break
     if not depths:
         raise RuntimeError("no frames for calibration")
-    return build_baseline(depths), last_rgb
+    return build_baseline(depths), last_rgb, build_noise(depths)
 
 
 class Service:
@@ -175,7 +168,8 @@ class Service:
         self.player = Player(cfg.path(cfg.audio.sounds_dir), cfg.audio.device, cfg.audio.volume)
         self.store = EventStore(Path(cfg.storage.events_dir), Path(cfg.storage.fallback_dir).expanduser(),
                                 cfg.capture.fps, cfg.storage.pre_seconds, cfg.storage.post_seconds,
-                                cfg.storage.retention_days)
+                                cfg.storage.retention_days, cfg.storage.save_raw,
+                                cfg.storage.raw_retention_days)
         self.enabled = True
         self.dry_run = dry_run
         self._recalibrate = False
@@ -313,8 +307,9 @@ class Service:
                 if self._handle_requests(src) or self._recalibrate:
                     self._recalibrate = False
                     log.info("recalibrating baseline")
-                    base, snap = calibrate_frames(frames, self.cfg.depth.baseline_frames)
+                    base, snap, noise = calibrate_frames(frames, self.cfg.depth.baseline_frames)
                     self.calib.baseline = base
+                    self.calib.noise = noise
                     self.calib.save(self.calib_dir)
                     cv2.imwrite(str(self.calib_dir / "snapshot.jpg"), cv2.cvtColor(snap, cv2.COLOR_RGB2BGR))
                     self.pipe.depth.reset_static()
@@ -336,6 +331,7 @@ class Service:
                     log.info("static object absorbed into baseline")
                     self.calib.save(self.calib_dir)
                 frame = annotate(rgb, v.candidates, datetime.now().strftime("%H:%M:%S ") + v.label(), v.cat_box)
+                self.store.push_raw(rgb, depth)
                 self.store.push(frame)
                 if v.candidates:
                     log.debug("cand %s", [(round(b.area_m2, 3), round(b.height_mm)) for b in v.candidates])
@@ -346,7 +342,10 @@ class Service:
                         self.ha.state("cat", "ON" if v.present else "OFF")
                 if v.trigger and self.enabled:
                     name = "(dry run)" if self.dry_run else self.player.play()
-                    snap, jpg = self.store.event(frame, "dry" if self.dry_run else "cat")
+                    # camera detections: snapshot the frame the cat was actually seen on
+                    snap_img = (annotate(v.snap_rgb, [], datetime.now().strftime("%H:%M:%S ") + v.label(), v.cat_box)
+                                if v.snap_rgb is not None else frame)
+                    snap, jpg = self.store.event(snap_img, "dry" if self.dry_run else "cat")
                     log.info("TRIGGER %s sound=%s snapshot=%s", v.label(), name, snap)
                     if self.ha:
                         self.ha.trigger(jpg, datetime.now(timezone.utc).isoformat())

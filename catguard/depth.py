@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,26 +56,67 @@ def build_baseline(frames: list[np.ndarray]) -> np.ndarray:
     return np.nan_to_num(med, nan=0.0).astype(np.float32)
 
 
-class Calibration:
-    """Baseline depth + ROI polygon, persisted in calibration_dir."""
+def build_noise(frames: list[np.ndarray]) -> np.ndarray:
+    """Per-pixel depth noise (robust sigma, mm) of the temporally-filtered signal.
 
-    def __init__(self, baseline: np.ndarray, polygon: list[list[int]]):
+    Pixels that drop out (0) in more than 20% of frames are unreliable: they get
+    a large sigma so only a big height change there counts.
+    """
+    filt = [temporal_median(frames[max(0, i - 2):i + 1]) for i in range(2, len(frames))] or frames
+    stack = np.stack(filt).astype(np.float32)
+    valid = stack > 0
+    rate = valid.mean(axis=0)
+    stack[~valid] = np.nan
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        med = np.nanmedian(stack, axis=0)
+        mad = np.nanmedian(np.abs(stack - med), axis=0)
+    sigma = np.nan_to_num(mad * 1.4826, nan=100.0).astype(np.float32)
+    sigma[rate < 0.8] = np.maximum(sigma[rate < 0.8], 50.0)
+    return sigma
+
+
+def temporal_median(frames: list[np.ndarray]) -> np.ndarray:
+    """Median of up to 3 depth frames, ignoring dropouts (0).
+
+    A pixel valid in only 1 of 3 frames is treated as invalid (flicker).
+    """
+    if len(frames) == 1:
+        return frames[0]
+    st = np.sort(np.stack(frames[-3:]).astype(np.float32), axis=0)
+    n = (st > 0).sum(axis=0)
+    if st.shape[0] == 2:
+        out = np.where(n == 2, (st[0] + st[1]) / 2, 0)
+    else:
+        out = np.where(n == 3, st[1], np.where(n == 2, (st[1] + st[2]) / 2, 0))
+    return out.astype(np.uint16)
+
+
+class Calibration:
+    """Baseline depth + per-pixel noise + ROI polygon, persisted in calibration_dir."""
+
+    def __init__(self, baseline: np.ndarray, polygon: list[list[int]], noise: np.ndarray | None = None):
         self.baseline = baseline.astype(np.float32)
+        self.noise = noise.astype(np.float32) if noise is not None else None
         self.polygon = polygon
         self.roi = roi_mask(baseline.shape, polygon)
 
     def save(self, d: Path):
         d.mkdir(parents=True, exist_ok=True)
         np.save(d / "baseline.npy", self.baseline)
+        if self.noise is not None:
+            np.save(d / "noise.npy", self.noise)
         (d / "roi.json").write_text(json.dumps({"polygon": self.polygon}))
 
     @classmethod
     def load(cls, d: Path) -> "Calibration":
         baseline = np.load(d / "baseline.npy")
+        noise = np.load(d / "noise.npy") if (d / "noise.npy").exists() else None
         poly = []
         if (d / "roi.json").exists():
             poly = json.loads((d / "roi.json").read_text())["polygon"]
-        return cls(baseline, poly)
+        return cls(baseline, poly, noise)
 
     def set_polygon(self, polygon):
         self.polygon = polygon
@@ -90,6 +132,8 @@ class DepthDetector:
         # static-blob tracking for baseline absorption
         self._static_since: float | None = None
         self._static_ref: np.ndarray | None = None
+        self._recent: deque[np.ndarray] = deque(maxlen=3)
+        self.filtered: np.ndarray | None = None   # last temporally-filtered depth
 
     def reset_static(self):
         self._static_since, self._static_ref = None, None
@@ -101,13 +145,23 @@ class DepthDetector:
         h[(d == 0) | (b == 0)] = 0.0
         return h
 
+    def threshold_map(self) -> np.ndarray | float:
+        c = self.cfg
+        if self.calib.noise is None:
+            return c.min_height_mm
+        return np.maximum(c.min_height_mm, c.noise_k * self.calib.noise)
+
     def detect(self, depth: np.ndarray) -> list[Blob]:
         c = self.cfg
+        if c.temporal_frames > 1:
+            self._recent.append(depth)
+            depth = temporal_median(list(self._recent)[-c.temporal_frames:])
+        self.filtered = depth
         h = self.height_map(depth)
         # Whole-frame foreground with NO upper height bound: a person leaning in
         # forms one component reaching outside the ROI (low inside fraction), so
         # it is rejected. Height limits are applied per-blob on the in-ROI part.
-        fg = (h >= c.min_height_mm).astype(np.uint8)
+        fg = (h >= self.threshold_map()).astype(np.uint8)
         fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, self._kernel)
         fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, self._kernel)
         n, labels, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
@@ -176,3 +230,62 @@ def colorize_depth(depth: np.ndarray, max_mm: int = 4000) -> np.ndarray:
     img = cv2.applyColorMap(255 - d, cv2.COLORMAP_JET)
     img[depth == 0] = 0
     return img
+
+
+class MotionGate:
+    """Is a cat-sized blob *animate*? A cat moves; a kettle that has just been put
+    down does not.
+
+    Motion is only measured between two frames in which the blob was a standalone
+    candidate (not attached to an arm reaching in from outside the counter), so
+    the hand that placed an object doesn't count as the object moving.
+    """
+
+    def __init__(self, lag: int = 5, motion_mm: float = 40.0, motion_frac: float = 0.12,
+                 centroid_px: float = 8.0, hold_s: float = 2.0, settle_s: float = 1.5):
+        self.lag, self.motion_mm, self.motion_frac = lag, motion_mm, motion_frac
+        self.centroid_px, self.hold_s, self.settle_s = centroid_px, hold_s, settle_s
+        self._person: list[tuple[np.ndarray, float]] = []   # (mask, until): recently touched by a person
+        self.hist: deque[tuple[np.ndarray, list[Blob]]] = deque(maxlen=lag + 1)
+        self._moving_until: list[tuple[np.ndarray, float]] = []   # (mask, until)
+        self.last_score: float = 0.0
+
+    def update(self, depth: np.ndarray, cands: list[Blob], now: float,
+               person_masks: list[np.ndarray] = ()) -> list[bool]:
+        """Return, for each candidate, whether it's animate (moved recently).
+
+        person_masks: person-sized blobs this frame. Movement at a spot a person
+        touched within settle_s (e.g. a hand putting a kettle down and pulling
+        away) does not count.
+        """
+        self._person = [(m, t) for m, t in self._person if t > now]
+        for m in person_masks:
+            self._person.append((cv2.dilate(m.astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool),
+                                 now + self.settle_s))
+        self.hist.append((depth, cands))
+        self._moving_until = [(m, t) for m, t in self._moving_until if t > now]
+        out = []
+        self.last_score = 0.0
+        old = self.hist[0] if len(self.hist) > self.lag else None
+        for b in cands:
+            moved = False
+            if old is not None:
+                od, oc = old
+                prev = [o for o in oc if np.count_nonzero(o.mask & b.mask) >= 0.3 * min(o.pixels, b.pixels)]
+                if prev:
+                    o = max(prev, key=lambda o: np.count_nonzero(o.mask & b.mask))
+                    region = (b.mask | o.mask) & (depth > 0) & (od > 0)
+                    if region.any():
+                        diff = np.abs(depth[region].astype(np.float32) - od[region].astype(np.float32))
+                        frac = float(np.mean(diff > self.motion_mm))
+                        (cx, cy), (ox, oy) = b.center, o.center
+                        shift = float(np.hypot(cx - ox, cy - oy))
+                        self.last_score = max(self.last_score, frac)
+                        moved = frac >= self.motion_frac or shift >= self.centroid_px
+            if moved and any(np.count_nonzero(m & b.mask) > 0.05 * b.pixels for m, _ in self._person):
+                moved = False   # a person was just here: it's their hand, not the object
+            if moved:
+                self._moving_until.append((b.mask, now + self.hold_s))
+            recent = any(np.count_nonzero(m & b.mask) >= 0.3 * b.pixels for m, _ in self._moving_until)
+            out.append(moved or recent)
+        return out

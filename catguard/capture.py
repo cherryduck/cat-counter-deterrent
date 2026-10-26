@@ -77,17 +77,31 @@ class KinectSource:
 
 
 class ReplaySource:
+    """Replays a recorded session dir (chunk_*.npz) or an event file (*.raw.npz)."""
+
     def __init__(self, path: Path, realtime: bool = False):
-        self.files = sorted(Path(path).glob("chunk_*.npz"))
+        path = Path(path)
+        self.files = [path] if path.is_file() else sorted(path.glob("chunk_*.npz"))
         if not self.files:
             raise FileNotFoundError(f"no chunk_*.npz in {path}")
         self.realtime = realtime
 
+    @staticmethod
+    def _iter_file(f):
+        z = np.load(f)
+        if "rgb_jpg" in z:
+            import cv2
+            buf, off = z["rgb_jpg"], z["rgb_off"]
+            for i, (ts, depth) in enumerate(zip(z["ts"], z["depth"])):
+                bgr = cv2.imdecode(buf[off[i]:off[i + 1]], cv2.IMREAD_COLOR)
+                yield ts, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), depth
+        else:
+            yield from zip(z["ts"], z["rgb"], z["depth"])
+
     def frames(self) -> Iterator[Frame]:
         prev = None
         for f in self.files:
-            z = np.load(f)
-            for ts, rgb, depth in zip(z["ts"], z["rgb"], z["depth"]):
+            for ts, rgb, depth in self._iter_file(f):
                 if self.realtime and prev is not None:
                     time.sleep(max(0.0, min(1.0, ts - prev)))
                 prev = ts

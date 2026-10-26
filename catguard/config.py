@@ -24,6 +24,12 @@ class DepthCfg:
     baseline_frames: int = 60       # frames averaged when calibrating
     absorb_after_s: float = 180.0   # absorb static non-cat blobs into baseline after this
     static_tolerance_mm: float = 25.0
+    temporal_frames: int = 3        # per-pixel median over this many frames (kills flicker)
+    noise_k: float = 4.0            # per-pixel threshold = max(min_height, noise_k * sigma)
+    motion_lag: int = 5             # frames between motion comparisons (~0.33 s)
+    motion_mm: float = 40.0         # per-pixel depth change counted as movement
+    motion_frac: float = 0.12       # fraction of blob pixels that must change
+    motion_hold_s: float = 2.0      # stays "animate" this long after last movement
 
 
 @dataclass
@@ -78,6 +84,8 @@ class StorageCfg:
     retention_days: int = 30
     pre_seconds: float = 3.0
     post_seconds: float = 3.0
+    save_raw: bool = True             # raw RGB+depth per event for replay tuning (~10-20 MB each)
+    raw_retention_days: int = 7
 
 
 @dataclass

@@ -108,17 +108,88 @@ def test_decider_rate_limit():
     assert sum(fired) == 2
 
 
-def test_pipeline_dark_depth_only(det):
-    _, cfg = det
+def _cat_at(x, y, base=None):
+    return with_box(base if base is not None else empty(), x, y, 157, 87, 250)
+
+
+def test_pipeline_dark_moving_cat_triggers():
+    cfg = Config()
     base = build_baseline([empty()])
     pipe = Pipeline(cfg, Calibration(base, ROI), detector=None)
     rgb = np.zeros((H, W, 3), np.uint8)  # dark
-    cat = with_box(empty(), 250, 280, 157, 87, 250)
-    trig = [pipe.process(i * 0.1, rgb, cat).trigger for i in range(5)]
+    trig = [pipe.process(i * 0.067, rgb, _cat_at(200 + 6 * i, 280)).trigger for i in range(20)]
     assert trig.count(True) == 1
     pipe2 = Pipeline(cfg, Calibration(base, ROI), detector=None)
     pipe2.night_mode = "off"
-    assert not any(pipe2.process(i * 0.1, rgb, cat).trigger for i in range(5))
+    assert not any(pipe2.process(i * 0.067, rgb, _cat_at(200 + 6 * i, 280)).trigger for i in range(20))
+
+
+def test_static_object_does_not_trigger():
+    """Something cat-sized that just sits there (bag, kettle) is not a cat."""
+    cfg = Config()
+    pipe = Pipeline(cfg, Calibration(build_baseline([empty()]), ROI), detector=None)
+    rgb = np.zeros((H, W, 3), np.uint8)
+    noise = np.random.default_rng(1)
+    for i in range(60):
+        d = (_cat_at(250, 280).astype(np.int32) + noise.integers(-10, 11, (H, W))).astype(np.uint16)
+        assert not pipe.process(i * 0.067, rgb, d).trigger
+
+
+# Realistic scene for arrival tests: counter top occupies rows 200-330, below it
+# the cupboard fronts / floor where a person stands (outside the ROI).
+FRONT = [[100, 200], [540, 200], [540, 330], [100, 330]]
+
+
+def front_scene():
+    d = np.full((H, W), 2500, np.uint16)
+    d[200:330, 100:540] = COUNTER_MM
+    d[330:480, 100:540] = 1700        # cupboard fronts below the counter edge
+    return d
+
+
+def test_object_placed_by_hand_does_not_trigger():
+    """A person puts a kettle down and walks away: the arm moving over it must not count."""
+    cfg = Config()
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
+    rgb = np.zeros((H, W, 3), np.uint8)
+    trig = []
+    for i in range(60):
+        d = with_box(front_scene(), 250, 230, 120, 70, 200)        # the kettle
+        if i < 20:
+            sway = (i % 4) * 6
+            d[300:480, 200 + sway:420 + sway] = 900                   # torso in front of the counter
+            d[255:300, 300 + sway:340 + sway] = COUNTER_MM - 350      # forearm/hand over the kettle
+        trig.append(pipe.process(i * 0.067, rgb, d).trigger)
+    assert not any(trig)
+
+
+def test_cat_jumping_up_triggers_quickly():
+    """Cat crosses the counter edge (outside ROI) mid-jump, lands, then moves about."""
+    cfg = Config()
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
+    rgb = np.zeros((H, W, 3), np.uint8)
+    fired_at = None
+    for i in range(40):
+        d = front_scene()
+        if i < 3:
+            d[290:380, 260:340] = 1300                                # mid-jump across the front edge
+        else:
+            d = with_box(d, 220 + 5 * i, 235, 130, 75, 250)           # on the counter, walking
+        if pipe.process(i * 0.067, rgb, d).trigger and fired_at is None:
+            fired_at = i
+    assert fired_at is not None and (fired_at - 3) * 0.067 < 1.0     # < 1 s after landing
+
+
+def test_flicker_suppressed_by_temporal_median(det):
+    d, _ = det
+    rng = np.random.default_rng(2)
+    found = 0
+    for i in range(30):
+        f = empty()
+        speck = rng.random((H, W)) < 0.15          # 15% of pixels jump 90 mm each frame, randomly
+        f[speck & (np.arange(H)[:, None] > 250) & (np.arange(H)[:, None] < 330)] -= 90
+        found += sum(d.is_cat_sized(b) for b in d.detect(f))
+    assert found == 0
 
 
 class FakeDetector:

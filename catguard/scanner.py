@@ -19,7 +19,7 @@ class ScanWorker:
         self._frame: tuple | None = None
         self._cv = threading.Condition()
         self._streak = 0
-        self.result: tuple[bool, float, tuple | None, float] = (False, 0.0, None, 0.0)
+        self.result: tuple = (False, 0.0, None, 0.0, None)   # hit, score, box, ts, rgb
         self.scan_ms = 0.0
         self._stop = False
         self._t = threading.Thread(target=self._loop, daemon=True, name="scan")
@@ -30,11 +30,12 @@ class ScanWorker:
             self._frame = (rgb, region, roi)
             self._cv.notify()
 
-    def latest(self, max_age_s: float = 2.0) -> tuple[bool, float, tuple | None]:
-        hit, score, box, ts = self.result
+    def latest(self, max_age_s: float = 1.0):
+        """(hit, score, box, rgb_of_scanned_frame) - empty if the result is stale."""
+        hit, score, box, ts, rgb = self.result
         if time.monotonic() - ts > max_age_s:
-            return False, 0.0, None
-        return hit, score, box
+            return False, 0.0, None, None
+        return hit, score, box, rgb
 
     def stop(self):
         with self._cv:
@@ -51,6 +52,7 @@ class ScanWorker:
                 rgb, region, roi = self._frame
                 self._frame = None
             t = time.perf_counter()
+            t_frame = time.monotonic()
             try:
                 on, score, box = self.detector.scan(rgb, region, roi)
             except Exception:
@@ -59,4 +61,5 @@ class ScanWorker:
             self.scan_ms = (time.perf_counter() - t) * 1e3
             self._streak = self._streak + 1 if on else 0
             hit = on and (self._streak >= self.confirm_scans or score >= self.strong_conf)
-            self.result = (hit, score, box, time.monotonic())
+            # age is measured from when the frame was captured, not when the scan finished
+            self.result = (hit, score, box, t_frame, rgb)
