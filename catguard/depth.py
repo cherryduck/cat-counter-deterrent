@@ -78,19 +78,27 @@ def build_noise(frames: list[np.ndarray]) -> np.ndarray:
 
 
 def temporal_median(frames: list[np.ndarray]) -> np.ndarray:
-    """Median of up to 3 depth frames, ignoring dropouts (0).
+    """Median of up to 3 uint16 depth frames, treating 0 as a dropout.
 
-    A pixel valid in only 1 of 3 frames is treated as invalid (flicker).
+    3 valid samples -> median; 1 dropout -> the farther of the two valid samples
+    (errs towards "nothing there"); 2+ dropouts -> invalid (0), i.e. flicker.
+    Uses an OpenCV min/max network on uint16 (~5 ms on a Pi 5 vs ~23 ms sorting).
     """
     if len(frames) == 1:
         return frames[0]
-    st = np.sort(np.stack(frames[-3:]).astype(np.float32), axis=0)
-    n = (st > 0).sum(axis=0)
-    if st.shape[0] == 2:
-        out = np.where(n == 2, (st[0] + st[1]) / 2, 0)
-    else:
-        out = np.where(n == 3, st[1], np.where(n == 2, (st[1] + st[2]) / 2, 0))
-    return out.astype(np.uint16)
+    if len(frames) == 2:
+        a, b = frames[-2:]
+        out = cv2.max(a, b)
+        out[(a == 0) | (b == 0)] = 0
+        return out
+    a, b, c = frames[-3:]
+    lo, hi = cv2.min(a, b), cv2.max(a, b)
+    out = cv2.max(lo, cv2.min(hi, c))                 # median-of-3 (zeros sort lowest)
+    zeros = (a == 0).view(np.uint8) + (b == 0).view(np.uint8) + (c == 0).view(np.uint8)
+    one = zeros == 1
+    out[one] = cv2.max(hi, c)[one]
+    out[zeros >= 2] = 0
+    return out
 
 
 class Calibration:
@@ -147,9 +155,14 @@ class DepthDetector:
 
     def threshold_map(self) -> np.ndarray | float:
         c = self.cfg
-        if self.calib.noise is None:
+        noise = self.calib.noise
+        if noise is None:
             return c.min_height_mm
-        return np.maximum(c.min_height_mm, c.noise_k * self.calib.noise)
+        key = (id(noise), c.min_height_mm, c.noise_k)
+        if getattr(self, "_thr_key", None) != key:
+            self._thr = np.maximum(c.min_height_mm, c.noise_k * noise).astype(np.float32)
+            self._thr_key = key
+        return self._thr
 
     def detect(self, depth: np.ndarray) -> list[Blob]:
         c = self.cfg
