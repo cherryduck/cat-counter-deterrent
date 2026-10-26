@@ -7,3 +7,5 @@ recordings/
 models/*.onnx
 sounds/*.wav
 config.toml
+deploy/nas/mosquitto/config/passwd
+.secrets/
