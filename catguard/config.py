@@ -81,6 +81,12 @@ class StorageCfg:
 
 
 @dataclass
+class WebCfg:
+    enabled: bool = True
+    port: int = 8080
+
+
+@dataclass
 class Config:
     capture: CaptureCfg = field(default_factory=CaptureCfg)
     depth: DepthCfg = field(default_factory=DepthCfg)
@@ -89,6 +95,7 @@ class Config:
     audio: AudioCfg = field(default_factory=AudioCfg)
     mqtt: MqttCfg = field(default_factory=MqttCfg)
     storage: StorageCfg = field(default_factory=StorageCfg)
+    web: WebCfg = field(default_factory=WebCfg)
     base_dir: Path = Path(".")
 
     def path(self, p: str) -> Path:

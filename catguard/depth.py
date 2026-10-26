@@ -91,6 +91,9 @@ class DepthDetector:
         self._static_since: float | None = None
         self._static_ref: np.ndarray | None = None
 
+    def reset_static(self):
+        self._static_since, self._static_ref = None, None
+
     def height_map(self, depth: np.ndarray) -> np.ndarray:
         d = depth.astype(np.float32)
         b = self.calib.baseline

@@ -48,3 +48,7 @@ events_dir = "/mnt/catcam"
 fallback_dir = "~/catguard-events"
 calibration_dir = "calibration"
 retention_days = 30
+
+[web]
+enabled = true           # live view / aiming page on http://<pi>:8080/
+port = 8080
