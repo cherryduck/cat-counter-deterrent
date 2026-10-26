@@ -36,7 +36,8 @@ class KinectSource:
                 time.sleep(0.1)
                 continue
             fails = 0
-            yield time.time(), v[0], d[0].astype(np.uint16)
+            # freenect returns views onto its internal buffers: copy both
+            yield time.time(), np.array(v[0], copy=True), np.array(d[0], dtype=np.uint16, copy=True)
 
     def close(self):
         try:

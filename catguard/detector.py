@@ -24,16 +24,19 @@ def crop_box(bbox, shape, margin: float, min_side: int = 96):
 
 
 class CatDetector:
-    def __init__(self, cfg: DetectorCfg, model_path):
+    def __init__(self, cfg: DetectorCfg, model_path, imgsz: int | None = None, threads: int = 4,
+                 full_frame_fallback: bool = True):
         import onnxruntime as ort
         so = ort.SessionOptions()
-        so.intra_op_num_threads = 4
+        so.intra_op_num_threads = threads
         self.sess = ort.InferenceSession(str(model_path), so, providers=["CPUExecutionProvider"])
         self.inp = self.sess.get_inputs()[0].name
         self.cfg = cfg
+        self.imgsz = imgsz or cfg.imgsz
+        self.full_frame_fallback = full_frame_fallback
 
     def _prep(self, rgb: np.ndarray):
-        s = self.cfg.imgsz
+        s = self.imgsz
         h, w = rgb.shape[:2]
         r = s / max(h, w)
         nh, nw = int(round(h * r)), int(round(w * r))
@@ -66,8 +69,40 @@ class CatDetector:
         x0, y0, w, h = crop_box(bbox, rgb.shape, self.cfg.crop_margin)
         crop = rgb[y0:y0 + h, x0:x0 + w]
         score, _ = self.cat_score(crop)
-        if score < self.cfg.cat_conf:
+        if score < self.cfg.cat_conf and self.full_frame_fallback:
             # fall back to the full frame (crop can cut a stretched-out cat)
             full, _ = self.cat_score(rgb)
             score = max(score, full)
         return score >= self.cfg.cat_conf, score
+
+    def scan(self, rgb: np.ndarray, region: tuple[int, int, int, int],
+             roi: np.ndarray) -> tuple[bool, float, tuple[int, int, int, int] | None]:
+        """Look for a cat standing on the counter, without needing depth.
+
+        The ROI's bounding box is cut into square tiles (so a cat stays large
+        relative to the model input) and each tile is checked. A detection
+        counts only if the bottom-centre of the cat box (its feet) is inside
+        the ROI mask.
+        """
+        x, y, w, h = region
+        H, W = rgb.shape[:2]
+        side = min(max(h + 2 * int(h * 0.25), self.cfg.scan_tile), W, H)
+        y0 = max(0, min(H - side, y + h // 2 - side // 2))
+        n = max(1, int(np.ceil(w / (side * 0.8))))
+        xs = [x] if n == 1 else np.linspace(x, x + w - side, n).astype(int)
+        best = (False, 0.0, None)
+        for x0 in xs:
+            x0 = int(max(0, min(W - side, x0)))
+            score, box = self.cat_score(rgb[y0:y0 + side, x0:x0 + side])
+            if box is None or score < self.cfg.cat_conf:
+                best = max(best, (False, score, None), key=lambda b: b[1])
+                continue
+            bx, by, bw, bh = box
+            gx, gy = x0 + bx, y0 + by
+            fx = int(np.clip(gx + bw // 2, 0, W - 1))
+            fy = int(np.clip(gy + bh - 1, 0, H - 1))
+            on = bool(roi[fy, fx])
+            cand = (on, score, (gx, gy, bw, bh))
+            if (on, score) > (best[0], best[1]):
+                best = cand
+        return best

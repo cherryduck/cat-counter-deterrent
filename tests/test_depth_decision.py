@@ -119,3 +119,42 @@ def test_pipeline_dark_depth_only(det):
     pipe2 = Pipeline(cfg, Calibration(base, ROI), detector=None)
     pipe2.night_mode = "off"
     assert not any(pipe2.process(i * 0.1, rgb, cat).trigger for i in range(5))
+
+
+class FakeDetector:
+    """Scan-only detector stub: reports a cat whose feet are at `feet` (or none)."""
+    def __init__(self, feet=None, score=0.9):
+        self.feet, self.score, self.scans = feet, score, 0
+
+    def confirm(self, rgb, bbox):
+        return False, 0.0
+
+    def scan(self, rgb, region, roi):
+        self.scans += 1
+        if self.feet is None:
+            return False, 0.0, None
+        fx, fy = self.feet
+        return bool(roi[fy, fx]), self.score, (fx - 40, fy - 60, 80, 60)
+
+
+def _lit():
+    return np.full((H, W, 3), 160, np.uint8)
+
+
+def test_lit_scan_finds_cat_without_depth():
+    cfg = Config()
+    base = build_baseline([empty()])
+    det = FakeDetector(feet=(300, 300))          # on the counter
+    pipe = Pipeline(cfg, Calibration(base, ROI), detector=det)
+    blind = np.zeros((H, W), np.uint16)         # sunlight: no depth at all
+    trig = [pipe.process(i * 0.1, _lit(), blind).trigger for i in range(8)]
+    assert trig.count(True) == 1
+    assert det.scans == 4                        # scan_every=2
+
+
+def test_lit_scan_ignores_cat_off_counter():
+    cfg = Config()
+    base = build_baseline([empty()])
+    det = FakeDetector(feet=(300, 120))          # on top of the wall cupboards, outside ROI
+    pipe = Pipeline(cfg, Calibration(base, ROI), detector=det)
+    assert not any(pipe.process(i * 0.1, _lit(), empty()).trigger for i in range(10))

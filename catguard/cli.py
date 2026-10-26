@@ -147,7 +147,7 @@ def cmd_replay(cfg, args):
             print(n, v.label(), [(round(b.area_m2, 3), round(b.height_mm), round(b.inside_roi, 2))
                                  for b in v.blobs])
         if args.video:
-            img = annotate(rgb, v.candidates, f"#{n} {v.label()}")
+            img = annotate(rgb, v.candidates, f"#{n} {v.label()}", v.cat_box)
             if vw is None:
                 vw = cv2.VideoWriter(args.video, cv2.VideoWriter_fourcc(*"mp4v"), cfg.capture.fps,
                                      (img.shape[1], img.shape[0]))
