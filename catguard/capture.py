@@ -39,6 +39,36 @@ class KinectSource:
             # freenect returns views onto its internal buffers: copy both
             yield time.time(), np.array(v[0], copy=True), np.array(d[0], dtype=np.uint16, copy=True)
 
+    def _libs(self):
+        import ctypes
+        import ctypes.util
+        if not hasattr(self, "_sync"):
+            self._sync = ctypes.CDLL(ctypes.util.find_library("freenect_sync") or "libfreenect_sync.so.0.5")
+            self._fnl = ctypes.CDLL(ctypes.util.find_library("freenect") or "libfreenect.so.0.5")
+            self._fnl.freenect_get_tilt_degs.restype = ctypes.c_double
+        return self._sync, self._fnl
+
+    def set_tilt(self, degrees: int):
+        """Drive the Kinect tilt motor (-27..27 deg) via libfreenect_sync (not in the Python wrapper).
+
+        Only ever called on an explicit user request - never at startup, since
+        moving the motor invalidates the depth baseline.
+        """
+        import ctypes
+        sync, _ = self._libs()
+        rc = sync.freenect_sync_set_tilt_degs(ctypes.c_int(int(degrees)), ctypes.c_int(self.index))
+        if rc != 0:
+            raise RuntimeError(f"tilt failed (rc={rc})")
+
+    def get_tilt(self) -> float | None:
+        """Current motor angle in degrees (from the motor's own state), or None."""
+        import ctypes
+        sync, fnl = self._libs()
+        state = ctypes.c_void_p()
+        if sync.freenect_sync_get_tilt_state(ctypes.byref(state), ctypes.c_int(self.index)) != 0:
+            return None
+        return float(fnl.freenect_get_tilt_degs(state))
+
     def close(self):
         try:
             self.fn.sync_stop()

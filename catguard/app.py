@@ -1,7 +1,9 @@
 """The detection pipeline (shared by live run and offline replay) and the live service."""
 from __future__ import annotations
 
+import json
 import logging
+import queue
 import signal
 import time
 from dataclasses import dataclass, field
@@ -183,6 +185,59 @@ class Service:
         if cfg.mqtt.enabled:
             from .mqtt_ha import HaBridge
             self.ha = HaBridge(cfg.mqtt, self.command)
+        # aiming state: Kinect tilt + "view changed since calibration" flag
+        self._aim_file = self.calib_dir / "aim.json"
+        aim = json.loads(self._aim_file.read_text()) if self._aim_file.exists() else {}
+        self.tilt = int(aim.get("tilt", 0))
+        self.calib_stale = bool(aim.get("stale", False))
+        self._requests: queue.Queue = queue.Queue()
+        self._fps = 0.0
+        self._last_v: Verdict | None = None
+        self._roi_valid = 0
+        self.web = None
+        if cfg.web.enabled:
+            from .web import WebUI
+            try:
+                self.web = WebUI(self, cfg.web.port)
+            except OSError:
+                log.exception("live view disabled: could not bind port %d", cfg.web.port)
+
+    # ---- live view / aiming -------------------------------------------------
+    def request(self, name: str, arg):
+        """Called from web threads; executed on the main loop."""
+        self._requests.put((name, arg))
+
+    def _save_aim(self):
+        self._aim_file.write_text(json.dumps({"tilt": self.tilt, "stale": self.calib_stale}))
+
+    def web_state(self) -> dict:
+        v = self._last_v
+        return {"tilt": self.tilt, "calib_stale": self.calib_stale, "polygon": self.calib.polygon,
+                "fps": round(self._fps, 1), "label": v.label() if v else "", "present": bool(v and v.present),
+                "enabled": self.enabled, "dry_run": self.dry_run,
+                "triggers_today": self.ha.triggers_today if self.ha else None,
+                "roi_depth_valid": self._roi_valid, "min_height_mm": self.cfg.depth.min_height_mm}
+
+    def _handle_requests(self, src) -> bool:
+        """Process queued web requests. Returns True if a recalibration was requested."""
+        recal = False
+        while not self._requests.empty():
+            name, arg = self._requests.get_nowait()
+            log.info("live view request %s %s", name, arg if name != "roi" else f"{len(arg)} points")
+            if name == "tilt":
+                if hasattr(src, "set_tilt"):
+                    src.set_tilt(arg)
+                    self.tilt = arg
+                    self.calib_stale = True
+                    self._save_aim()
+            elif name == "roi":
+                self.calib.set_polygon(arg)
+                self.calib.save(self.calib_dir)
+            elif name == "recalibrate":
+                recal = True
+            elif name == "test_sound":
+                self._test_sound = True
+        return recal
 
     # Commands arrive on the MQTT thread; keep handlers trivial.
     def command(self, name: str, payload: str):
@@ -230,26 +285,52 @@ class Service:
             self._publish_settings()
             self.ha.state("cat", "OFF")
         src = open_source(self.cfg.capture.source, realtime=True)
+        # Never move the motor at startup (it would invalidate the baseline);
+        # just read where it currently is.
+        if hasattr(src, "get_tilt"):
+            try:
+                cur = src.get_tilt()
+                if cur is not None:
+                    self.tilt = int(round(cur))
+                    log.info("Kinect tilt is %.1f deg", cur)
+            except Exception:
+                log.exception("could not read tilt")
         period = 1.0 / self.cfg.capture.fps
         last_present = False
         frames = src.frames()
         log.info("running (enabled=%s dry_run=%s)", self.enabled, self.dry_run)
         stats_t, stats_n, proc_ms = time.monotonic(), 0, 0.0
+        prev_start = None
         try:
             while self._running:
                 t_start = time.monotonic()
-                ts, rgb, depth = next(frames)
-                if self._recalibrate:
+                try:
+                    ts, rgb, depth = next(frames)
+                except StopIteration:
+                    log.info("source ended")
+                    break
+                if self._handle_requests(src) or self._recalibrate:
                     self._recalibrate = False
                     log.info("recalibrating baseline")
-                    base, _ = calibrate_frames(frames, self.cfg.depth.baseline_frames)
+                    base, snap = calibrate_frames(frames, self.cfg.depth.baseline_frames)
                     self.calib.baseline = base
                     self.calib.save(self.calib_dir)
+                    cv2.imwrite(str(self.calib_dir / "snapshot.jpg"), cv2.cvtColor(snap, cv2.COLOR_RGB2BGR))
+                    self.pipe.depth.reset_static()
+                    self.calib_stale = False
+                    self._save_aim()
                     continue
                 if self._test_sound:
                     self._test_sound = False
                     log.info("test sound: %s", self.player.play())
                 v = self.pipe.process(ts, rgb, depth, now=time.monotonic())
+                if self.calib_stale:
+                    v.trigger = False   # view moved since calibration: don't act on it
+                self._last_v = v
+                if self.web and self.web.hub.wanted:
+                    roi = self.calib.roi
+                    self._roi_valid = int(100 * np.count_nonzero((depth > 0) & roi) / max(1, roi.sum()))
+                    self.web.hub.publish(rgb, depth, v, self.pipe.depth.height_map(depth))
                 if v.absorbed:
                     log.info("static object absorbed into baseline")
                     self.calib.save(self.calib_dir)
@@ -269,6 +350,9 @@ class Service:
                     if self.ha:
                         self.ha.trigger(jpg, datetime.now(timezone.utc).isoformat())
                 dt = time.monotonic() - t_start
+                if prev_start is not None:
+                    self._fps = 0.9 * self._fps + 0.1 / max(1e-3, t_start - prev_start)
+                prev_start = t_start
                 stats_n += 1
                 proc_ms += dt * 1e3
                 if time.monotonic() - stats_t >= 30:
@@ -282,6 +366,8 @@ class Service:
         finally:
             if self.scanner:
                 self.scanner.stop()
+            if self.web:
+                self.web.stop()
             src.close()
             if self.ha:
                 self.ha.stop()
