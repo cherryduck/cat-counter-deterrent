@@ -72,7 +72,7 @@ class HaBridge:
         self._disc("sensor", "last_trigger", {"name": "Last trigger",
                                               "state_topic": f"{t}/last_trigger",
                                               "device_class": "timestamp"})
-        self._disc("camera", "snapshot", {"name": "Last trigger", "topic": f"{t}/snapshot"})
+        self._disc("camera", "snapshot", {"name": "Last snapshot", "topic": f"{t}/snapshot"})
         self._disc("button", "test_sound", {"name": "Test sound",
                                             "command_topic": f"{t}/test_sound/press",
                                             "icon": "mdi:volume-high"})
@@ -131,6 +131,7 @@ class HaBridge:
         if date.today() != self._today:
             self._today, self.triggers_today = date.today(), 0
         self.triggers_today += 1
+        # snapshot first, so automations firing on last_trigger see the new image
+        self.c.publish(f"{self.t}/snapshot", jpg, retain=True, qos=1).wait_for_publish(2)
         self.state("triggers_today", self.triggers_today)
         self.state("last_trigger", iso_ts)
-        self.c.publish(f"{self.t}/snapshot", jpg, retain=True)
