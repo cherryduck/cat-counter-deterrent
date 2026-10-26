@@ -78,16 +78,53 @@ def test_too_tall_ignored(det):
     assert blobs and not any(d.is_cat_sized(b) for b in blobs)
 
 
-def test_static_object_absorbed(det):
+def test_static_object_fades_into_background(det):
     d, cfg = det
     frame = with_box(empty(), 250, 280, 150, 90, 200)  # kettle-ish, placed and left
+    first = d.detect(frame, now=0.0)
+    assert any(d.is_cat_sized(b) for b in first)
     t = 0.0
-    absorbed = False
-    while t < cfg.depth.absorb_after_s + 2:
-        absorbed |= d.maybe_absorb(frame, d.detect(frame), is_cat=False, now=t)
-        t += 1
-    assert absorbed
-    assert d.detect(frame) == []
+    while t < 30:
+        t += 1 / 15
+        blobs = d.detect(frame, now=t)
+    assert blobs == []                               # gone after ~30 s
+    # ...and something new elsewhere is still detected straight away
+    new = with_box(frame, 400, 380, 120, 70, 250)
+    d.detect(new, now=t + 0.067)                     # temporal median needs it in 2 of 3 frames
+    assert any(d.is_cat_sized(b) for b in d.detect(new, now=t + 0.133))
+
+
+def test_night_drift_heals_without_triggering():
+    """Tonight's bug: after dark the counter edge reads 2-4 depth steps closer
+    than the daytime calibration, in flickering strips. Must not trigger."""
+    cfg = Config()
+    day = front_scene()
+    pipe = Pipeline(cfg, Calibration(build_baseline([day]), FRONT), detector=None)
+    rgb = np.zeros((H, W, 3), np.uint8)
+    rng = np.random.default_rng(3)
+    trig = []
+    # Dusk, as recorded on the real Pi: the phantom strip builds up over ~a minute.
+    # (Whether switching the kitchen light causes an *abrupt* shift is untested.)
+    for i in range(15 * 180):
+        night = day.copy()
+        p_on = min(0.8, max(0.0, (i / 15 - 10) / 60 * 0.8))
+        strip = np.zeros((H, W), bool)
+        strip[300:328, 150:420] = rng.random((28, 270)) < p_on   # flickery strip at the front edge
+        night[strip] = COUNTER_MM - 150                          # 3-4 steps "above" the counter
+        trig.append(pipe.process(i / 15, rgb, night).trigger)
+    assert sum(trig) == 0, f"{sum(trig)} triggers"
+
+
+def test_cat_still_detected_after_long_quiet_period():
+    cfg = Config()
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
+    rgb = np.zeros((H, W, 3), np.uint8)
+    for i in range(15 * 60):
+        pipe.process(i / 15, rgb, front_scene())
+    t0 = 60.0
+    fired = [pipe.process(t0 + i / 15, rgb, with_box(front_scene(), 240, 235, 130, 75, 250)).trigger
+             for i in range(15)]
+    assert any(fired[:8])                            # within ~0.5 s
 
 
 def test_decider_persistence_and_cooldown():

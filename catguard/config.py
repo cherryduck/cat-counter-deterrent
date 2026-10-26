@@ -26,6 +26,11 @@ class DepthCfg:
     static_tolerance_mm: float = 25.0
     temporal_frames: int = 3        # per-pixel median over this many frames (kills flicker)
     noise_k: float = 4.0            # per-pixel threshold = max(min_height, noise_k * sigma)
+    quant_k: float = 3.0            # ...and >= quant_k Kinect depth steps (2.85e-6*z^2 mm)
+    warmup_s: float = 5.0           # no depth triggers for this long after start
+    adapt_tau_s: float = 8.0        # background learning time constant (0 = off)
+    scenery_occ: float = 0.5        # occupancy above which a pixel is treated as background
+    absorb_occ: float = 0.9         # occupancy above which the baseline is updated (~20 s)
     motion_lag: int = 5             # frames between motion comparisons (~0.33 s)
     motion_mm: float = 40.0         # per-pixel depth change counted as movement (interior only)
     motion_interior_frac: float = 0.2   # fraction of interior pixels that must change

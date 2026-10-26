@@ -53,8 +53,10 @@ class Verdict:
 
 
 class Pipeline:
-    def __init__(self, cfg: Config, calib: Calibration, detector=None, scanner=None):
+    def __init__(self, cfg: Config, calib: Calibration, detector=None, scanner=None,
+                 warmup_s: float = 0.0):
         self.cfg = cfg
+        self.warmup_s = warmup_s        # live service only; replays/tests start warm
         self.scanner = scanner          # async ScanWorker (live); None = synchronous (replay/tests)
         self._streak = 0
         self.calib = calib
@@ -66,6 +68,7 @@ class Pipeline:
         self.decider = Decider(cfg.decision)
         self.night_mode = cfg.detector.night_mode
         self._n = 0
+        self._t_start: float | None = None
         self._last_scan = (False, 0.0, None)
         self._roi_cache = None
 
@@ -85,7 +88,7 @@ class Pipeline:
         self._n += 1
         c = self.cfg
         t0 = time.perf_counter()
-        blobs = self.depth.detect(depth)
+        blobs = self.depth.detect(depth, now)
         fd = self.depth.filtered if self.depth.filtered is not None else depth
         cands = sorted((b for b in blobs if self.depth.is_cat_sized(b)), key=lambda b: -b.pixels)
         persons = [b.mask for b in blobs if self.depth.is_person(b)]
@@ -118,11 +121,14 @@ class Pipeline:
             if s_hit:
                 cat_box, snap_rgb = s_box, s_rgb
                 reason = reason + "+camera" if reason else "camera"
+        if self._t_start is None:
+            self._t_start = now
+        if now - self._t_start < self.warmup_s and reason.startswith("depth"):
+            reason = ""   # warm-up: motion/territory memory and background still priming
         hit = bool(reason)
         t2 = time.perf_counter()
         trig = self.decider.update(hit, now=now)
-        absorbed = self.depth.maybe_absorb(fd, blobs, is_cat=hit or self.decider.present or any(animate),
-                                           now=now)
+        absorbed = False   # background adaptation (DepthDetector._adapt) replaces the old absorb
         return Verdict(ts, blobs, cands, dark, score, hit, self.decider.present, trig, absorbed,
                        {"depth_ms": (t1 - t0) * 1e3, "detect_ms": (t2 - t1) * 1e3}, cat_box,
                        reason, snap_rgb, self.motion.last_score)
@@ -165,7 +171,7 @@ class Service:
         if det is not None and cfg.detector.scan_every > 0:
             from .scanner import ScanWorker
             self.scanner = ScanWorker(det, cfg.detector.scan_confirm, cfg.detector.scan_strong_conf)
-        self.pipe = Pipeline(cfg, self.calib, det, self.scanner)
+        self.pipe = Pipeline(cfg, self.calib, det, self.scanner, warmup_s=cfg.depth.warmup_s)
         self.player = Player(cfg.path(cfg.audio.sounds_dir), cfg.audio.device, cfg.audio.volume)
         self.store = EventStore(Path(cfg.storage.events_dir), Path(cfg.storage.fallback_dir).expanduser(),
                                 cfg.capture.fps, cfg.storage.pre_seconds, cfg.storage.post_seconds,

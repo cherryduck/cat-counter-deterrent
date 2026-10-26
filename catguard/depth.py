@@ -142,6 +142,12 @@ class DepthDetector:
         self._static_ref: np.ndarray | None = None
         self._recent: deque[np.ndarray] = deque(maxlen=3)
         self.filtered: np.ndarray | None = None   # last temporally-filtered depth
+        # adaptive background: per-pixel occupancy (EMA of "above"/"below" baseline)
+        self._occ_up: np.ndarray | None = None
+        self._occ_dn: np.ndarray | None = None
+        self.scenery: np.ndarray | None = None    # pixels currently treated as background
+        self._last_now: float | None = None
+        self.adapted_px = 0
 
     def reset_static(self):
         self._static_since, self._static_ref = None, None
@@ -153,28 +159,41 @@ class DepthDetector:
         h[(d == 0) | (b == 0)] = 0.0
         return h
 
-    def threshold_map(self) -> np.ndarray | float:
+    def threshold_map(self) -> np.ndarray:
+        """Per-pixel height threshold (mm).
+
+        max(min_height, noise_k * measured noise, quant_k * Kinect depth step).
+        The Kinect measures disparity, so depth comes in steps of ~2.85e-6*z^2 mm
+        (~40 mm at 3.7 m): a fixed 60 mm threshold is barely one step far away.
+        """
         c = self.cfg
+        b = self.calib.baseline
         noise = self.calib.noise
-        if noise is None:
-            return c.min_height_mm
-        key = (id(noise), c.min_height_mm, c.noise_k)
+        key = (id(b), id(noise), c.min_height_mm, c.noise_k, c.quant_k)
         if getattr(self, "_thr_key", None) != key:
-            self._thr = np.maximum(c.min_height_mm, c.noise_k * noise).astype(np.float32)
+            thr = np.full(b.shape, c.min_height_mm, np.float32)
+            thr = np.maximum(thr, c.quant_k * 2.85e-6 * b.astype(np.float32) ** 2)
+            if noise is not None:
+                thr = np.maximum(thr, c.noise_k * noise)
+            self._thr = thr
             self._thr_key = key
         return self._thr
 
-    def detect(self, depth: np.ndarray) -> list[Blob]:
+    def detect(self, depth: np.ndarray, now: float | None = None) -> list[Blob]:
         c = self.cfg
         if c.temporal_frames > 1:
             self._recent.append(depth)
             depth = temporal_median(list(self._recent)[-c.temporal_frames:])
         self.filtered = depth
         h = self.height_map(depth)
+        thr = self.threshold_map()
         # Whole-frame foreground with NO upper height bound: a person leaning in
         # forms one component reaching outside the ROI (low inside fraction), so
         # it is rejected. Height limits are applied per-blob on the in-ROI part.
-        fg = (h >= self.threshold_map()).astype(np.uint8)
+        up = h >= thr
+        fg = up.astype(np.uint8)
+        if self.scenery is not None:
+            fg[self.scenery] = 0
         fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, self._kernel)
         fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, self._kernel)
         n, labels, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
@@ -197,7 +216,46 @@ class DepthDetector:
             x, y, w, hh = (int(stats[i, k]) for k in
                            (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
             blobs.append(Blob((x, y, w, hh), px, area, float(np.median(h[m_in])), inside, z, m))
+        self._adapt(depth, h, thr, up, blobs, now)
         return blobs
+
+    def _adapt(self, depth, h, thr, up, blobs, now):
+        """Slowly learn the background so lighting drift / objects left out heal.
+
+        Each pixel keeps an occupancy EMA of being above (or below) the baseline.
+        - occupancy > scenery_occ: masked out of detection (persistent, not new)
+        - occupancy > absorb_occ:  baseline set to the current depth
+        Pixels under a person are frozen (people standing still mustn't vanish).
+        Time constant adapt_tau_s (~8 s): a cat that just arrived is detected long
+        before it could become scenery; one that sits still for ~20 s fades out.
+        """
+        c = self.cfg
+        if c.adapt_tau_s <= 0:
+            return
+        dt = 1 / 15 if now is None or self._last_now is None else max(0.0, min(1.0, now - self._last_now))
+        self._last_now = now
+        a = np.float32(min(1.0, dt / c.adapt_tau_s))
+        if self._occ_up is None or self._occ_up.shape != h.shape:
+            self._occ_up = np.zeros(h.shape, np.float32)
+            self._occ_dn = np.zeros(h.shape, np.float32)
+        valid = depth > 0
+        dn = (h <= -thr) & valid
+        frozen = np.zeros(h.shape, bool)
+        for b in blobs:
+            if self.is_person(b):
+                frozen |= b.mask
+        upd = ~frozen
+        cv2.accumulateWeighted(up.astype(np.float32), self._occ_up, float(a), mask=upd.view(np.uint8))
+        cv2.accumulateWeighted(dn.astype(np.float32), self._occ_dn, float(a), mask=upd.view(np.uint8))
+        self.scenery = self._occ_up > c.scenery_occ
+        absorb = ((self._occ_up > c.absorb_occ) | (self._occ_dn > c.absorb_occ)) & valid & upd
+        n = int(np.count_nonzero(absorb))
+        if n:
+            self.calib.baseline[absorb] = depth[absorb]
+            self._occ_up[absorb] = 0
+            self._occ_dn[absorb] = 0
+            self.adapted_px += n
+            self._thr_key = None   # baseline changed -> threshold map depends on it
 
     def is_cat_sized(self, b: Blob) -> bool:
         c = self.cfg
@@ -279,7 +337,21 @@ class MotionGate:
         self._moving_until: list[tuple[np.ndarray, float]] = []   # (mask, until)
         self._person: list[tuple[np.ndarray, float]] = []         # (mask, until): touched by a person
         self._last_person = -1e9
-        self._tracks: list[dict] = []                              # {mask, last, arrival}
+        self._tracks: list[dict] = []                              # {mask, last, arrival, n}
+        self._seen: np.ndarray | None = None                       # last time each pixel was in a candidate
+        self.footprint_s = 30.0
+        self.arrive_frames = 4
+        self.min_moves = 3          # movement must be seen in >= this many checks...
+        self.moves_window_s = 1.0   # ...within this window (flicker gives isolated hits)
+        self._moves: list[tuple[np.ndarray, float]] = []
+        # territory memory: where candidates have been in the last territory_mem_s,
+        # applied with a delay so the cat's own last few frames don't count
+        self.territory_frac = 0.12
+        self.territory_mem_s = 3.0
+        self.territory_delay_s = 0.4
+        self._terr_pending: deque[tuple[float, np.ndarray]] = deque()
+        self._terr_seen: np.ndarray | None = None
+        self._terr_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         self._kernel = np.ones((5, 5), np.uint8)
         self.last_score: float = 0.0
         self.last_why: str = ""
@@ -303,16 +375,29 @@ class MotionGate:
         old = self.hist[0] if len(self.hist) > self.lag else None
         out = []
         self.last_score, self.last_why = 0.0, ""
+        if self._seen is None or self._seen.shape != depth.shape:
+            self._seen = np.full(depth.shape, -1e9, np.float64)
+            self._terr_seen = np.full(depth.shape, -1e9, np.float64)
+        while self._terr_pending and now - self._terr_pending[0][0] >= self.territory_delay_s:
+            t, m = self._terr_pending.popleft()
+            self._terr_seen[m] = t
+        recent_area = (now - self._terr_seen) <= self.territory_mem_s
+        known = cv2.dilate(recent_area.view(np.uint8), self._terr_kernel).view(bool) if recent_area.any() else None
         for b in cands:
             why = ""
-            # --- arrival: a new blob with no person around = it got there by itself
+            # --- arrival: a new blob with no person around = it got there by itself.
+            # Not if something was at that spot recently (flickering phantoms keep
+            # "re-arriving"), and only once it has persisted for a few frames.
             tr = next((t for t in self._tracks
                        if np.count_nonzero(t["mask"] & b.mask) >= 0.3 * b.pixels), None)
             if tr is None:
-                tr = {"arrival": now - self._last_person > self.person_window_s, "born": now}
+                fresh = np.mean(now - self._seen[b.mask] > self.footprint_s) > 0.7
+                tr = {"arrival": fresh and now - self._last_person > self.person_window_s,
+                      "born": now, "n": 0}
                 self._tracks.append(tr)
-                if tr["arrival"]:
-                    why = "arrived"
+            tr["n"] += 1
+            if tr["arrival"] and tr["n"] == self.arrive_frames:
+                why = "arrived"
             tr["mask"], tr["last"] = b.mask, now
             # --- movement vs `lag` frames ago
             if old is not None and not why:
@@ -328,18 +413,33 @@ class MotionGate:
                     frac = (float(np.mean(np.abs(depth[core].astype(np.float32) - od[core]) > self.motion_mm))
                             if core.any() else 0.0)
                     self.last_score = max(self.last_score, frac, 1 - iou)
-                    if shift >= self.shift_px:
-                        why = f"shift {shift:.0f}px"
-                    elif iou < self.iou_min:
-                        why = f"shape iou {iou:.2f}"
+                    # "new ground": share of the blob outside everywhere candidates have
+                    # been in the last few seconds. Flickering phantoms split/merge
+                    # inside their own footprint (centroid jumps ~20 px, IoU drops)
+                    # but rarely gain ground; a walking cat gains ground every frame.
+                    terr = (np.count_nonzero(b.mask & ~known) / b.pixels) if known is not None else 0.0
+                    self.last_score = max(self.last_score, terr)
+                    if terr >= self.territory_frac:
+                        why = f"new ground {terr:.2f}"
                     elif frac >= self.interior_frac:
                         why = f"interior {frac:.2f}"
             if why and why != "arrived" and any(np.count_nonzero(m & b.mask) > 0.05 * b.pixels
                                                  for m, _ in self._person):
                 why = ""   # a person was just here: it's their hand, not the object
+            if why and why != "arrived":
+                self._moves = [(m, t) for m, t in self._moves if now - t <= self.moves_window_s]
+                n_prev = sum(np.count_nonzero(m & b.mask) >= 0.3 * b.pixels for m, _ in self._moves)
+                self._moves.append((b.mask, now))
+                if n_prev + 1 < self.min_moves:
+                    why = ""          # isolated movement reading: wait for confirmation
             if why:
                 self._moving_until.append((b.mask, now + self.hold_s))
                 self.last_why = why
             recent = any(np.count_nonzero(m & b.mask) >= 0.3 * b.pixels for m, _ in self._moving_until)
             out.append(bool(why) or recent)
+        u = np.zeros(depth.shape, bool)
+        for b in cands:
+            self._seen[b.mask] = now
+            u |= b.mask
+        self._terr_pending.append((now, u))
         return out
