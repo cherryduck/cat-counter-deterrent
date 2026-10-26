@@ -60,7 +60,8 @@ class Pipeline:
         self.calib = calib
         self.depth = DepthDetector(cfg.depth, calib)
         dc = cfg.depth
-        self.motion = MotionGate(dc.motion_lag, dc.motion_mm, dc.motion_frac, hold_s=dc.motion_hold_s)
+        self.motion = MotionGate(dc.motion_lag, dc.motion_mm, dc.motion_interior_frac, dc.motion_shift_px,
+                                 dc.motion_iou_min, dc.motion_hold_s, person_window_s=dc.person_window_s)
         self.detector = detector
         self.decider = Decider(cfg.decision)
         self.night_mode = cfg.detector.night_mode
@@ -87,7 +88,7 @@ class Pipeline:
         blobs = self.depth.detect(depth)
         fd = self.depth.filtered if self.depth.filtered is not None else depth
         cands = sorted((b for b in blobs if self.depth.is_cat_sized(b)), key=lambda b: -b.pixels)
-        persons = [b.mask for b in blobs if b.area_m2 > c.depth.max_area_m2]
+        persons = [b.mask for b in blobs if self.depth.is_person(b)]
         animate = self.motion.update(fd, cands, now, persons)
         t1 = time.perf_counter()
         (rx, ry, rw, rh), feet_roi = self._roi()
@@ -99,7 +100,7 @@ class Pipeline:
         # 1) depth: a cat-sized thing on the counter that is moving by itself
         moving = [b for b, a in zip(cands, animate) if a]
         if moving and (not dark or self.night_mode == "depth_only"):
-            reason = "depth+motion"
+            reason = "depth:" + (self.motion.last_why or "moving")
         # 2) camera: YOLO scan of the counter (covers depth blind spots, e.g. sunlight)
         if not dark and self.detector is not None and c.detector.scan_every > 0:
             if self.scanner is not None:
@@ -296,6 +297,9 @@ class Service:
         log.info("running (enabled=%s dry_run=%s)", self.enabled, self.dry_run)
         stats_t, stats_n, proc_ms = time.monotonic(), 0, 0.0
         prev_start = None
+        cand_since = None          # near-miss recorder: cat-sized blob present without a trigger
+        cand_last_seen = -1e9
+        cand_saved = False
         try:
             while self._running:
                 t_start = time.monotonic()
@@ -340,6 +344,20 @@ class Service:
                     log.info("cat present=%s (%s)", v.present, v.label())
                     if self.ha:
                         self.ha.state("cat", "ON" if v.present else "OFF")
+                # near-miss recorder: save raw data when something cat-sized sits on the
+                # counter for 1 s without triggering (no notification / sound)
+                mono = time.monotonic()
+                if v.candidates:
+                    if cand_since is None or mono - cand_last_seen > 10:
+                        cand_since, cand_saved = mono, False
+                    cand_last_seen = mono
+                    if (not cand_saved and not v.present and mono - cand_since >= 1.0
+                            and self.cfg.storage.save_near_misses):
+                        cand_saved = True
+                        snap, _ = self.store.event(frame, "cand")
+                        log.info("near miss recorded (%s) %s", v.label(), snap)
+                if v.trigger:
+                    cand_saved = True
                 if v.trigger and self.enabled:
                     name = "(dry run)" if self.dry_run else self.player.play()
                     # camera detections: snapshot the frame the cat was actually seen on

@@ -125,14 +125,17 @@ def test_pipeline_dark_moving_cat_triggers():
 
 
 def test_static_object_does_not_trigger():
-    """Something cat-sized that just sits there (bag, kettle) is not a cat."""
+    """Something cat-sized put down by a person that then just sits there is not a cat."""
     cfg = Config()
-    pipe = Pipeline(cfg, Calibration(build_baseline([empty()]), ROI), detector=None)
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
     rgb = np.zeros((H, W, 3), np.uint8)
     noise = np.random.default_rng(1)
-    for i in range(60):
-        d = (_cat_at(250, 280).astype(np.int32) + noise.integers(-10, 11, (H, W))).astype(np.uint16)
-        assert not pipe.process(i * 0.067, rgb, d).trigger
+    for i in range(80):
+        d = with_box(front_scene(), 250, 230, 120, 70, 200)
+        if i < 10:
+            d[300:480, 150:500] = 900                                  # person standing at the counter
+        d = (d.astype(np.int32) + noise.integers(-10, 11, (H, W))).astype(np.uint16)
+        assert not pipe.process(i * 0.067, rgb, d).trigger, i
 
 
 # Realistic scene for arrival tests: counter top occupies rows 200-330, below it
@@ -157,14 +160,14 @@ def test_object_placed_by_hand_does_not_trigger():
         d = with_box(front_scene(), 250, 230, 120, 70, 200)        # the kettle
         if i < 20:
             sway = (i % 4) * 6
-            d[300:480, 200 + sway:420 + sway] = 900                   # torso in front of the counter
+            d[300:480, 150 + sway:500 + sway] = 900                   # torso in front of the counter
             d[255:300, 300 + sway:340 + sway] = COUNTER_MM - 350      # forearm/hand over the kettle
         trig.append(pipe.process(i * 0.067, rgb, d).trigger)
     assert not any(trig)
 
 
 def test_cat_jumping_up_triggers_quickly():
-    """Cat crosses the counter edge (outside ROI) mid-jump, lands, then moves about."""
+    """Cat crosses the counter edge (outside ROI) mid-jump, lands, then sits still."""
     cfg = Config()
     pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
     rgb = np.zeros((H, W, 3), np.uint8)
@@ -174,10 +177,26 @@ def test_cat_jumping_up_triggers_quickly():
         if i < 3:
             d[290:380, 260:340] = 1300                                # mid-jump across the front edge
         else:
-            d = with_box(d, 220 + 5 * i, 235, 130, 75, 250)           # on the counter, walking
+            d = with_box(d, 240, 235, 130, 75, 250)                   # landed, sitting still
         if pipe.process(i * 0.067, rgb, d).trigger and fired_at is None:
             fired_at = i
-    assert fired_at is not None and (fired_at - 3) * 0.067 < 1.0     # < 1 s after landing
+    assert fired_at is not None and (fired_at - 3) * 0.067 < 0.5     # arrival rule: fast
+
+
+def test_cat_walking_after_being_placed_triggers():
+    """Placed by hand (no arrival credit) but then walks along the counter."""
+    cfg = Config()
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
+    rgb = np.zeros((H, W, 3), np.uint8)
+    fired_at = None
+    for i in range(60):
+        x = 200 if i < 25 else 200 + 4 * (i - 25)                     # sits 1.7 s, then walks
+        d = with_box(front_scene(), x, 235, 130, 75, 250)
+        if i < 10:
+            d[300:480, 150:500] = 900
+        if pipe.process(i * 0.067, rgb, d).trigger and fired_at is None:
+            fired_at = i
+    assert fired_at is not None and fired_at <= 25 + 15                # within 1 s of starting to walk
 
 
 def test_flicker_suppressed_by_temporal_median(det):

@@ -27,9 +27,13 @@ class DepthCfg:
     temporal_frames: int = 3        # per-pixel median over this many frames (kills flicker)
     noise_k: float = 4.0            # per-pixel threshold = max(min_height, noise_k * sigma)
     motion_lag: int = 5             # frames between motion comparisons (~0.33 s)
-    motion_mm: float = 40.0         # per-pixel depth change counted as movement
-    motion_frac: float = 0.12       # fraction of blob pixels that must change
+    motion_mm: float = 40.0         # per-pixel depth change counted as movement (interior only)
+    motion_interior_frac: float = 0.2   # fraction of interior pixels that must change
+    motion_shift_px: float = 5.0    # ...or centroid moves this far in `motion_lag` frames
+    motion_iou_min: float = 0.7     # ...or shape overlap drops below this
     motion_hold_s: float = 2.0      # stays "animate" this long after last movement
+    person_window_s: float = 2.0
+    person_min_area_m2: float = 0.08    # bottom-edge blob at least this big counts as a person    # new blob with no person seen for this long = arrived by itself
 
 
 @dataclass
@@ -86,6 +90,7 @@ class StorageCfg:
     post_seconds: float = 3.0
     save_raw: bool = True             # raw RGB+depth per event for replay tuning (~10-20 MB each)
     raw_retention_days: int = 7
+    save_near_misses: bool = True     # record cat-sized blobs that didn't trigger (for tuning)
 
 
 @dataclass
