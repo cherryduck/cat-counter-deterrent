@@ -1,0 +1,9 @@
+PLAN.md
+__pycache__/
+*.pyc
+.venv/
+calibration/
+recordings/
+models/*.onnx
+sounds/*.wav
+config.toml

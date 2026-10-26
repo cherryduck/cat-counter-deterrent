@@ -1,0 +1,2 @@
+[console_scripts]
+catguard = catguard.cli:main
