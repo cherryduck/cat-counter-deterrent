@@ -179,7 +179,7 @@ class Service:
         self.ha = None
         if cfg.mqtt.enabled:
             from .mqtt_ha import HaBridge
-            self.ha = HaBridge(cfg.mqtt, self.command)
+            self.ha = HaBridge(cfg.mqtt, self.command, counter_file=self.calib_dir / "triggers_today.json")
         # aiming state: Kinect tilt + "view changed since calibration" flag
         self._aim_file = self.calib_dir / "aim.json"
         aim = json.loads(self._aim_file.read_text()) if self._aim_file.exists() else {}
@@ -366,7 +366,10 @@ class Service:
                     snap, jpg = self.store.event(snap_img, "dry" if self.dry_run else "cat")
                     log.info("TRIGGER %s sound=%s snapshot=%s", v.label(), name, snap)
                     if self.ha:
-                        self.ha.trigger(jpg, datetime.now(timezone.utc).isoformat())
+                        try:
+                            self.ha.trigger(jpg, datetime.now(timezone.utc).isoformat())
+                        except Exception:
+                            log.exception("Home Assistant update failed (trigger still handled)")
                 dt = time.monotonic() - t_start
                 if prev_start is not None:
                     self._fps = 0.9 * self._fps + 0.1 / max(1e-3, t_start - prev_start)
@@ -374,6 +377,8 @@ class Service:
                 stats_n += 1
                 proc_ms += dt * 1e3
                 if time.monotonic() - stats_t >= 30:
+                    if self.ha:
+                        self.ha.roll_day()
                     el = time.monotonic() - stats_t
                     log.info("stats: %.1f fps, %.0f ms/frame, scan %.0f ms, %s, blobs=%d",
                              stats_n / el, proc_ms / stats_n,

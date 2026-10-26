@@ -248,3 +248,21 @@ def test_lit_scan_ignores_cat_off_counter():
     det = FakeDetector(feet=(300, 120))          # on top of the wall cupboards, outside ROI
     pipe = Pipeline(cfg, Calibration(base, ROI), detector=det)
     assert not any(pipe.process(i * 0.1, _lit(), empty()).trigger for i in range(10))
+
+
+def test_trigger_count_persists_and_survives_offline_broker(tmp_path):
+    import json
+    from datetime import date, timedelta
+    from catguard.config import MqttCfg
+    from catguard.mqtt_ha import HaBridge
+    f = tmp_path / "c.json"
+    f.write_text(json.dumps({"date": date.today().isoformat(), "count": 3}))
+    b = HaBridge(MqttCfg(host="127.0.0.1", port=1), lambda n, p: None, counter_file=f)
+    assert b.triggers_today == 3
+    b.trigger(b"jpg", "t")                       # broker unreachable: must not raise
+    assert b.triggers_today == 4 and json.loads(f.read_text())["count"] == 4
+    b._today = date.today() - timedelta(days=1)
+    b.roll_day()
+    assert b.triggers_today == 0 and json.loads(f.read_text())["count"] == 0
+    f.write_text(json.dumps({"date": "2020-01-01", "count": 9}))
+    assert HaBridge(MqttCfg(), lambda n, p: None, counter_file=f).triggers_today == 0

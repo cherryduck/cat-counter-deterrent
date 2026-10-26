@@ -21,13 +21,22 @@ DEVICE = {"identifiers": ["catguard"], "name": "Cat Guard", "manufacturer": "DIY
 
 
 class HaBridge:
-    def __init__(self, cfg: MqttCfg, on_command: Callable[[str, str], None]):
+    def __init__(self, cfg: MqttCfg, on_command: Callable[[str, str], None], counter_file=None):
         import paho.mqtt.client as mqtt
         self.cfg = cfg
         self.t = cfg.base_topic
         self.on_command = on_command
+        # daily trigger count, persisted so service restarts don't reset it
+        self._counter_file = counter_file
         self._today = date.today()
         self.triggers_today = 0
+        if counter_file is not None and counter_file.exists():
+            try:
+                d = json.loads(counter_file.read_text())
+                if d.get("date") == self._today.isoformat():
+                    self.triggers_today = int(d.get("count", 0))
+            except (ValueError, OSError):
+                log.warning("could not read %s", counter_file)
         self.c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="catguard")
         if cfg.username:
             self.c.username_pw_set(cfg.username, cfg.password)
@@ -127,11 +136,29 @@ class HaBridge:
                 self._state[key] = v
         self.c.publish(f"{self.t}/{key}", v, retain=retain)
 
-    def trigger(self, jpg: bytes, iso_ts: str):
+    def _save_count(self):
+        if self._counter_file is not None:
+            try:
+                self._counter_file.write_text(json.dumps({"date": self._today.isoformat(),
+                                                          "count": self.triggers_today}))
+            except OSError:
+                log.warning("could not write %s", self._counter_file)
+
+    def roll_day(self):
+        """Reset the count at midnight (called periodically, not only on triggers)."""
         if date.today() != self._today:
             self._today, self.triggers_today = date.today(), 0
+            self._save_count()
+            self.state("triggers_today", 0)
+
+    def trigger(self, jpg: bytes, iso_ts: str):
+        self.roll_day()
         self.triggers_today += 1
+        self._save_count()
         # snapshot first, so automations firing on last_trigger see the new image
-        self.c.publish(f"{self.t}/snapshot", jpg, retain=True, qos=1).wait_for_publish(2)
+        try:
+            self.c.publish(f"{self.t}/snapshot", jpg, retain=True, qos=1).wait_for_publish(2)
+        except (RuntimeError, ValueError):
+            log.warning("MQTT offline: snapshot not sent (event still saved locally/NAS)")
         self.state("triggers_today", self.triggers_today)
         self.state("last_trigger", iso_ts)
