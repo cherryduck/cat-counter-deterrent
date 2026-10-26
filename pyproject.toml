@@ -1,0 +1,24 @@
+[project]
+name = "catguard"
+version = "0.1.0"
+description = "Kinect + Pi 5 cat-on-counter deterrent with Home Assistant integration"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "onnxruntime",
+    "paho-mqtt>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+catguard = "catguard.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["catguard"]
