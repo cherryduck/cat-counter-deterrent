@@ -23,8 +23,11 @@ def events_root(primary: Path, fallback: Path) -> Path:
     return fallback
 
 
-def annotate(rgb: np.ndarray, blobs, label: str) -> np.ndarray:
+def annotate(rgb: np.ndarray, blobs, label: str, cat_box=None) -> np.ndarray:
     img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    if cat_box is not None:
+        x, y, w, h = (int(v) for v in cat_box)
+        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
     for b in blobs:
         x, y, w, h = b.bbox
         cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2)

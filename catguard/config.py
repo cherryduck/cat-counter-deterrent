@@ -28,12 +28,20 @@ class DepthCfg:
 
 @dataclass
 class DetectorCfg:
-    model: str = "models/yolov8n.onnx"
-    imgsz: int = 320
+    model: str = "models/yolo11n_640.onnx"
+    imgsz: int = 640                # model input size (must match the exported model)
+    scan_tile: int = 320            # counter scan tile size in camera pixels (upscaled to imgsz)
     cat_conf: float = 0.35
     min_brightness: float = 40.0    # mean RGB luma below this = "dark" -> depth-only
     night_mode: str = "depth_only"  # "depth_only" or "off"
+    confirm_model: str = "models/yolov8n.onnx"   # fast model for tight crops around depth blobs
+    confirm_imgsz: int = 320
+    scan_threads: int = 3           # CPU threads for the background scan (Pi 5 has 4)
     crop_margin: float = 0.6        # crop = blob bbox grown by this fraction
+    scan_every: int = 2             # when lit, scan the whole counter for cats every N frames (0 = off)
+    scan_confirm: int = 2           # consecutive positive scans needed...
+    scan_strong_conf: float = 0.6   # ...unless a single scan is at least this confident
+    roi_feet_margin_px: int = 25    # ROI grown by this much for the "feet on counter" test
 
 
 @dataclass

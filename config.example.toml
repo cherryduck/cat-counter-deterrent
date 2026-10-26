@@ -13,7 +13,13 @@ min_inside_roi = 0.85    # people leaning in spill outside the counter -> reject
 absorb_after_s = 180     # forget a non-cat object left on the counter after 3 min
 
 [detector]
-model = "models/yolov8n.onnx"
+model = "models/yolo11n_640.onnx"
+imgsz = 640              # must match the exported model
+scan_tile = 320          # counter scanned in 320px tiles, upscaled 2x for small cats
+scan_confirm = 2
+scan_strong_conf = 0.6
+confirm_model = "models/yolov8n.onnx"   # fast model for crops around depth blobs
+confirm_imgsz = 320
 cat_conf = 0.35
 min_brightness = 40      # below = dark -> depth-only
 night_mode = "depth_only"
