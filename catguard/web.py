@@ -156,7 +156,14 @@ class WebUI:
                     return self._send(404, b'{"error":"not found"}')
                 self._send(200, b'{"ok":true}')
 
-        self.server = ThreadingHTTPServer(("0.0.0.0", port), H)
+        class Server(ThreadingHTTPServer):
+            def handle_error(self, request, client_address):
+                import sys
+                if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError, TimeoutError)):
+                    return   # browser/phone closed the stream: normal
+                super().handle_error(request, client_address)
+
+        self.server = Server(("0.0.0.0", port), H)
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True, name="web").start()
         log.info("live view on http://0.0.0.0:%d/", port)

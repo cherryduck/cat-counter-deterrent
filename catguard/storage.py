@@ -39,7 +39,7 @@ def annotate(rgb: np.ndarray, blobs, label: str, cat_box=None) -> np.ndarray:
 
 class EventStore:
     def __init__(self, primary: Path, fallback: Path, fps: float, pre_s: float, post_s: float,
-                 retention_days: int):
+                 retention_days: int, save_raw: bool = False, raw_retention_days: int = 7):
         self.primary, self.fallback = primary, fallback
         self.fps = fps
         self.ring: deque[np.ndarray] = deque(maxlen=max(1, int(pre_s * fps)))
@@ -47,6 +47,37 @@ class EventStore:
         self.retention_days = retention_days
         self._pending: list[tuple[Path, list[np.ndarray], int]] = []
         self._last_cleanup = 0.0
+        # raw RGB+depth for offline replay/tuning (catguard replay <file>.raw.npz)
+        self.save_raw = save_raw
+        self.raw_retention_days = raw_retention_days
+        self.raw_ring: deque[tuple[float, np.ndarray, np.ndarray]] = deque(maxlen=max(1, int(pre_s * fps)))
+        self._raw_pending: list[tuple[Path, list, int]] = []
+
+    def push_raw(self, rgb: np.ndarray, depth: np.ndarray):
+        if not self.save_raw:
+            return
+        item = (time.time(), rgb, depth)
+        self.raw_ring.append(item)
+        still = []
+        for path, frames, remaining in self._raw_pending:
+            frames.append(item)
+            if remaining - 1 <= 0:
+                threading.Thread(target=self._write_raw, args=(path, frames), daemon=True).start()
+            else:
+                still.append((path, frames, remaining - 1))
+        self._raw_pending = still
+
+    @staticmethod
+    def _write_raw(path: Path, frames):
+        try:
+            jpgs = [cv2.imencode(".jpg", cv2.cvtColor(f[1], cv2.COLOR_RGB2BGR),
+                                 [cv2.IMWRITE_JPEG_QUALITY, 92])[1] for f in frames]
+            off = np.cumsum([0] + [len(j) for j in jpgs])
+            np.savez_compressed(path, ts=np.array([f[0] for f in frames]),
+                                depth=np.stack([f[2] for f in frames]),
+                                rgb_jpg=np.concatenate(jpgs).astype(np.uint8), rgb_off=off)
+        except Exception:
+            log.exception("could not write raw %s", path)
 
     def push(self, bgr: np.ndarray):
         """Feed every (annotated, BGR) frame; completes clips that are waiting on post frames."""
@@ -76,6 +107,8 @@ class EventStore:
         except OSError:
             log.exception("could not write snapshot")
         self._pending.append((day / f"{stem}.mp4", list(self.ring), self.post_frames))
+        if self.save_raw:
+            self._raw_pending.append((day / f"{stem}.raw.npz", list(self.raw_ring), self.post_frames))
         return snap, jpg_b
 
     def _write_clip(self, path: Path, frames: list[np.ndarray]):
@@ -90,12 +123,13 @@ class EventStore:
 
     def cleanup(self):
         cutoff = time.time() - self.retention_days * 86400
+        raw_cutoff = time.time() - self.raw_retention_days * 86400
         for root in {self.primary, self.fallback}:
             if not root.exists():
                 continue
             for p in root.glob("*/*"):
                 try:
-                    if p.stat().st_mtime < cutoff:
+                    if p.stat().st_mtime < (raw_cutoff if p.name.endswith(".raw.npz") else cutoff):
                         p.unlink()
                 except OSError:
                     pass

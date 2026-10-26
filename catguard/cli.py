@@ -60,9 +60,9 @@ def cmd_calibrate(cfg, args):
         poly = Calibration.load(d).polygon
     src = open_source(cfg.capture.source)
     print(f"capturing {cfg.depth.baseline_frames} frames - keep the counter empty and still")
-    base, rgb = calibrate_frames(src.frames(), cfg.depth.baseline_frames)
+    base, rgb, noise = calibrate_frames(src.frames(), cfg.depth.baseline_frames)
     src.close()
-    cal = Calibration(base, poly)
+    cal = Calibration(base, poly, noise)
     cal.save(d)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     cv2.imwrite(str(d / "snapshot.jpg"), bgr)
