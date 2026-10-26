@@ -284,6 +284,7 @@ class Service:
             time.sleep(1.0)  # let retained settings restore before publishing ours
             self._publish_settings()
             self.ha.state("cat", "OFF")
+            self.ha.state("triggers_today", self.ha.triggers_today)
         src = open_source(self.cfg.capture.source, realtime=True)
         # Never move the motor at startup (it would invalidate the baseline);
         # just read where it currently is.
