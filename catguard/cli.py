@@ -127,7 +127,7 @@ def cmd_replay(cfg, args):
     from .storage import annotate
     calib_dir = Path(args.calibration) if args.calibration else cfg.path(cfg.storage.calibration_dir)
     calib = Calibration.load(calib_dir)
-    pipe = Pipeline(cfg, calib, None if args.no_model else load_detector(cfg))
+    pipe = Pipeline(cfg, calib, None if args.no_model else load_detector(cfg), warmup_s=args.warmup)
     src = open_source(args.dir)
     vw = None
     n = trig = cand_frames = hit_frames = 0
@@ -181,6 +181,7 @@ def main(argv=None):
     s = sub.add_parser("record"); s.add_argument("dir"); s.add_argument("--seconds", type=float, default=30)
     s = sub.add_parser("replay"); s.add_argument("dir"); s.add_argument("--video")
     s.add_argument("--calibration"); s.add_argument("--no-model", action="store_true")
+    s.add_argument("--warmup", type=float, default=0.0, help="simulate live start-up grace (s)")
     sub.add_parser("test-sound")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
