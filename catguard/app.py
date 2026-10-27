@@ -203,12 +203,12 @@ class Service:
             from .scanner import ScanWorker
             self.scanner = ScanWorker(det, cfg.detector.scan_confirm, cfg.detector.scan_strong_conf)
         self.pipe = Pipeline(cfg, self.calib, det, self.scanner, warmup_s=cfg.depth.warmup_s)
-        self.store.baseline_fn = lambda: self.calib.baseline
         self.player = Player(cfg.path(cfg.audio.sounds_dir), cfg.audio.device, cfg.audio.volume)
         self.store = EventStore(Path(cfg.storage.events_dir), Path(cfg.storage.fallback_dir).expanduser(),
                                 cfg.capture.fps, cfg.storage.pre_seconds, cfg.storage.post_seconds,
                                 cfg.storage.retention_days, cfg.storage.save_raw,
                                 cfg.storage.raw_retention_days)
+        self.store.baseline_fn = lambda: self.calib.baseline
         self.enabled = True
         self.dry_run = dry_run
         self._recalibrate = False
