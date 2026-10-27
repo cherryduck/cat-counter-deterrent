@@ -30,6 +30,7 @@ class DepthCfg:
     warmup_s: float = 5.0           # no depth triggers for this long after start
     adapt_tau_s: float = 8.0        # background learning time constant (0 = off)
     scenery_occ: float = 0.5        # occupancy above which a pixel is treated as background
+    adapt_every: int = 3            # update the background every N frames (cost)
     adapt_max_mm: float = 150.0     # background may drift at most this far from calibration...
     adapt_max_steps: float = 5.0    # ...or this many Kinect depth steps, whichever is larger
     absorb_occ: float = 0.9         # occupancy above which the baseline is updated (~20 s)

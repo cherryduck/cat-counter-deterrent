@@ -150,6 +150,8 @@ class DepthDetector:
         self.adapted_px = 0
         self._ref_id = None    # id of the calibrated baseline the drift limit refers to
         self._ref = None
+        self._adapt_dt = 0.0
+        self._adapt_n = 0
 
     def reset_static(self):
         self._static_since, self._static_ref = None, None
@@ -236,33 +238,49 @@ class DepthDetector:
             return
         dt = 1 / 15 if now is None or self._last_now is None else max(0.0, min(1.0, now - self._last_now))
         self._last_now = now
-        a = np.float32(min(1.0, dt / c.adapt_tau_s))
+        # Runs every adapt_every frames with the accumulated dt (tau is seconds, so
+        # this is equivalent to per-frame for learning; saves ~8 ms/frame on a Pi 5).
+        self._adapt_dt += dt
+        self._adapt_n += 1
+        if self._adapt_n % c.adapt_every and self.scenery is not None:
+            return
+        a = float(min(1.0, self._adapt_dt / c.adapt_tau_s))
+        self._adapt_dt = 0.0
         if self._occ_up is None or self._occ_up.shape != h.shape:
             self._occ_up = np.zeros(h.shape, np.float32)
             self._occ_dn = np.zeros(h.shape, np.float32)
-        valid = depth > 0
         # Only *drift* may be learned: depth within adapt_max_steps Kinect depth
         # steps (min adapt_max_mm) of the calibrated empty counter. Lighting bias is
         # 1-4 steps; a person (>= ~0.5 m closer) never qualifies, so someone sitting
         # still can't be absorbed and then show up as cat-sized pieces when they move.
         if self._ref_id != id(self.calib.baseline):        # new calibration
-            self._ref = self.calib.baseline.copy()
-            self._ref_id = id(self.calib.baseline)
-            self._lim = np.maximum(c.adapt_max_mm, c.adapt_max_steps * 2.85e-6 * self._ref ** 2)
-        drift_ok = valid & (np.abs(depth.astype(np.float32) - self._ref) <= self._lim)
-        dn = (h <= -thr) & valid
-        frozen = np.zeros(h.shape, bool)
-        for b in blobs:
-            if self.is_person(b):
-                frozen |= b.mask
-        upd = ~frozen
-        cv2.accumulateWeighted(up.astype(np.float32), self._occ_up, float(a), mask=upd.view(np.uint8))
-        cv2.accumulateWeighted(dn.astype(np.float32), self._occ_dn, float(a), mask=upd.view(np.uint8))
+            ref = self.calib.baseline.copy()
+            self._ref, self._ref_id = ref, id(self.calib.baseline)
+            lim = np.maximum(c.adapt_max_mm, c.adapt_max_steps * 2.85e-6 * ref ** 2)
+            u16 = lambda x: np.clip(x, 1, 65535).astype(np.uint16)   # lower bound >= 1: excludes dropouts
+            self._drift_lo, self._drift_hi = u16(ref - lim), u16(ref + lim)
+            self._scen_lo = u16(ref - c.max_height_mm)    # scenery: up to cat height above the counter
+            bad = ref <= 0
+            for arr in (self._drift_lo, self._scen_lo):
+                arr[bad] = 65535                         # no reference -> never in range
+        drift_ok = cv2.inRange(depth, self._drift_lo, self._drift_hi)       # uint8 0/255
+        scen_ok = cv2.inRange(depth, self._scen_lo, self._drift_hi)
+        dn = ((h <= -thr) & (depth > 0)).view(np.uint8)
+        upd = None
+        person = [b.mask for b in blobs if self.is_person(b)]
+        if person:
+            frozen = np.zeros(h.shape, bool)
+            for m in person:
+                frozen |= m
+            upd = (~frozen).view(np.uint8)
+        cv2.accumulateWeighted(up.view(np.uint8), self._occ_up, a, mask=upd)
+        cv2.accumulateWeighted(dn, self._occ_dn, a, mask=upd)
         # Scenery (masked, not learnt): anything persistently there up to cat height,
         # e.g. a kettle left out. Not people: their pixels are far above that.
-        rel = self._ref - depth.astype(np.float32)
-        self.scenery = (self._occ_up > c.scenery_occ) & valid & (rel <= c.max_height_mm) & (rel >= -self._lim)
-        absorb = ((self._occ_up > c.absorb_occ) | (self._occ_dn > c.absorb_occ)) & drift_ok & upd
+        self.scenery = (self._occ_up > c.scenery_occ) & (scen_ok > 0)
+        absorb = ((self._occ_up > c.absorb_occ) | (self._occ_dn > c.absorb_occ)) & (drift_ok > 0)
+        if upd is not None:
+            absorb &= upd.view(bool)
         n = int(np.count_nonzero(absorb))
         if n:
             self.calib.baseline[absorb] = depth[absorb]
