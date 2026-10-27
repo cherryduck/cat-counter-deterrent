@@ -70,6 +70,7 @@ class Pipeline:
         self._n = 0
         self._t_start: float | None = None
         self._last_scan = (False, 0.0, None)
+        self.camera_vetoes = 0
         self._roi_cache = None
 
     def _roi(self):
@@ -118,6 +119,10 @@ class Pipeline:
                                        sc, bx)
                 s_hit, score, s_box = self._last_scan
                 s_rgb = None
+            if s_hit and s_box is not None and person_in_box(fd, self.depth.reference, s_box,
+                                                            c.depth.max_height_mm, persons):
+                s_hit = False
+                self.camera_vetoes += 1
             if s_hit:
                 cat_box, snap_rgb = s_box, s_rgb
                 reason = reason + "+camera" if reason else "camera"
@@ -132,6 +137,32 @@ class Pipeline:
         return Verdict(ts, blobs, cands, dark, score, hit, self.decider.present, trig, absorbed,
                        {"depth_ms": (t1 - t0) * 1e3, "detect_ms": (t2 - t1) * 1e3}, cat_box,
                        reason, snap_rgb, self.motion.last_score)
+
+
+def person_in_box(depth: np.ndarray, ref: np.ndarray, box, max_height_mm: float,
+                  person_masks=(), tall_frac: float = 0.3) -> bool:
+    """Depth check for a camera "cat" box: is it really a person in front of the counter?
+
+    A cat on the counter is at most ~max_height above it. If a good share of the
+    box's valid depth is much nearer than that (someone's head/shoulders), or a
+    person-like depth blob overlaps it, it isn't a cat. With no valid depth
+    (sunlit window area) it can't veto - that's what the camera path is for.
+    """
+    H, W = depth.shape
+    x, y, w, h = (int(v) for v in box)
+    x0, y0, x1, y1 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
+    if x1 <= x0 or y1 <= y0:
+        return False
+    d = depth[y0:y1, x0:x1].astype(np.float32)
+    r = ref[y0:y1, x0:x1]
+    valid = (d > 0) & (r > 0)
+    for m in person_masks:
+        if np.count_nonzero(m[y0:y1, x0:x1]) > 0.2 * (x1 - x0) * (y1 - y0):
+            return True
+    if np.count_nonzero(valid) < 0.2 * valid.size:
+        return False
+    tall = (r - d > max_height_mm) & valid
+    return np.count_nonzero(tall) >= tall_frac * np.count_nonzero(valid)
 
 
 def load_detector(cfg: Config, live: bool = False):
@@ -172,6 +203,7 @@ class Service:
             from .scanner import ScanWorker
             self.scanner = ScanWorker(det, cfg.detector.scan_confirm, cfg.detector.scan_strong_conf)
         self.pipe = Pipeline(cfg, self.calib, det, self.scanner, warmup_s=cfg.depth.warmup_s)
+        self.store.baseline_fn = lambda: self.calib.baseline
         self.player = Player(cfg.path(cfg.audio.sounds_dir), cfg.audio.device, cfg.audio.volume)
         self.store = EventStore(Path(cfg.storage.events_dir), Path(cfg.storage.fallback_dir).expanduser(),
                                 cfg.capture.fps, cfg.storage.pre_seconds, cfg.storage.post_seconds,

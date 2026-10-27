@@ -127,6 +127,11 @@ def cmd_replay(cfg, args):
     from .storage import annotate
     calib_dir = Path(args.calibration) if args.calibration else cfg.path(cfg.storage.calibration_dir)
     calib = Calibration.load(calib_dir)
+    if args.live_baseline and str(args.dir).endswith(".raw.npz"):
+        z = np.load(args.dir)
+        if "baseline" in z:
+            print("using the live (adapted) baseline saved with the event")
+            calib.baseline = z["baseline"].astype(np.float32)
     pipe = Pipeline(cfg, calib, None if args.no_model else load_detector(cfg), warmup_s=args.warmup)
     src = open_source(args.dir)
     vw = None
@@ -182,6 +187,8 @@ def main(argv=None):
     s = sub.add_parser("replay"); s.add_argument("dir"); s.add_argument("--video")
     s.add_argument("--calibration"); s.add_argument("--no-model", action="store_true")
     s.add_argument("--warmup", type=float, default=0.0, help="simulate live start-up grace (s)")
+    s.add_argument("--live-baseline", action="store_true",
+                   help="for *.raw.npz events: start from the baseline the service had at the time")
     sub.add_parser("test-sound")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,

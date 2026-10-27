@@ -30,6 +30,8 @@ class DepthCfg:
     warmup_s: float = 5.0           # no depth triggers for this long after start
     adapt_tau_s: float = 8.0        # background learning time constant (0 = off)
     scenery_occ: float = 0.5        # occupancy above which a pixel is treated as background
+    adapt_max_mm: float = 150.0     # background may drift at most this far from calibration...
+    adapt_max_steps: float = 5.0    # ...or this many Kinect depth steps, whichever is larger
     absorb_occ: float = 0.9         # occupancy above which the baseline is updated (~20 s)
     motion_lag: int = 5             # frames between motion comparisons (~0.33 s)
     motion_mm: float = 40.0         # per-pixel depth change counted as movement (interior only)
@@ -47,6 +49,7 @@ class DetectorCfg:
     imgsz: int = 640                # model input size (must match the exported model)
     scan_tile: int = 320            # counter scan tile size in camera pixels (upscaled to imgsz)
     cat_conf: float = 0.35
+    person_conf: float = 0.35       # cat boxes mostly inside a person this confident are ignored
     min_brightness: float = 40.0    # mean RGB luma below this = "dark" -> depth-only
     night_mode: str = "depth_only"  # "depth_only" or "off"
     confirm_model: str = "models/yolov8n.onnx"   # fast model for tight crops around depth blobs

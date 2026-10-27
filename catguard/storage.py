@@ -52,6 +52,7 @@ class EventStore:
         self.raw_retention_days = raw_retention_days
         self.raw_ring: deque[tuple[float, np.ndarray, np.ndarray]] = deque(maxlen=max(1, int(pre_s * fps)))
         self._raw_pending: list[tuple[Path, list, int]] = []
+        self.baseline_fn = None    # set by the service: current (adapted) baseline, saved with raw events
 
     def push_raw(self, rgb: np.ndarray, depth: np.ndarray):
         if not self.save_raw:
@@ -62,20 +63,22 @@ class EventStore:
         for path, frames, remaining in self._raw_pending:
             frames.append(item)
             if remaining - 1 <= 0:
-                threading.Thread(target=self._write_raw, args=(path, frames), daemon=True).start()
+                threading.Thread(target=self._write_raw, args=(path, frames, getattr(self, "_raw_base", {}).pop(path, None)),
+                                 daemon=True).start()
             else:
                 still.append((path, frames, remaining - 1))
         self._raw_pending = still
 
     @staticmethod
-    def _write_raw(path: Path, frames):
+    def _write_raw(path: Path, frames, baseline=None):
         try:
             jpgs = [cv2.imencode(".jpg", cv2.cvtColor(f[1], cv2.COLOR_RGB2BGR),
                                  [cv2.IMWRITE_JPEG_QUALITY, 92])[1] for f in frames]
             off = np.cumsum([0] + [len(j) for j in jpgs])
             np.savez_compressed(path, ts=np.array([f[0] for f in frames]),
                                 depth=np.stack([f[2] for f in frames]),
-                                rgb_jpg=np.concatenate(jpgs).astype(np.uint8), rgb_off=off)
+                                rgb_jpg=np.concatenate(jpgs).astype(np.uint8), rgb_off=off,
+                                **({"baseline": baseline} if baseline is not None else {}))
         except Exception:
             log.exception("could not write raw %s", path)
 
@@ -108,7 +111,12 @@ class EventStore:
             log.exception("could not write snapshot")
         self._pending.append((day / f"{stem}.mp4", list(self.ring), self.post_frames))
         if self.save_raw:
-            self._raw_pending.append((day / f"{stem}.raw.npz", list(self.raw_ring), self.post_frames))
+            rp = day / f"{stem}.raw.npz"
+            self._raw_pending.append((rp, list(self.raw_ring), self.post_frames))
+            if self.baseline_fn is not None:
+                if not hasattr(self, "_raw_base"):
+                    self._raw_base = {}
+                self._raw_base[rp] = self.baseline_fn().astype(np.float32).copy()
         return snap, jpg_b
 
     def _write_clip(self, path: Path, frames: list[np.ndarray]):

@@ -148,6 +148,8 @@ class DepthDetector:
         self.scenery: np.ndarray | None = None    # pixels currently treated as background
         self._last_now: float | None = None
         self.adapted_px = 0
+        self._ref_id = None    # id of the calibrated baseline the drift limit refers to
+        self._ref = None
 
     def reset_static(self):
         self._static_since, self._static_ref = None, None
@@ -239,6 +241,15 @@ class DepthDetector:
             self._occ_up = np.zeros(h.shape, np.float32)
             self._occ_dn = np.zeros(h.shape, np.float32)
         valid = depth > 0
+        # Only *drift* may be learned: depth within adapt_max_steps Kinect depth
+        # steps (min adapt_max_mm) of the calibrated empty counter. Lighting bias is
+        # 1-4 steps; a person (>= ~0.5 m closer) never qualifies, so someone sitting
+        # still can't be absorbed and then show up as cat-sized pieces when they move.
+        if self._ref_id != id(self.calib.baseline):        # new calibration
+            self._ref = self.calib.baseline.copy()
+            self._ref_id = id(self.calib.baseline)
+            self._lim = np.maximum(c.adapt_max_mm, c.adapt_max_steps * 2.85e-6 * self._ref ** 2)
+        drift_ok = valid & (np.abs(depth.astype(np.float32) - self._ref) <= self._lim)
         dn = (h <= -thr) & valid
         frozen = np.zeros(h.shape, bool)
         for b in blobs:
@@ -247,8 +258,11 @@ class DepthDetector:
         upd = ~frozen
         cv2.accumulateWeighted(up.astype(np.float32), self._occ_up, float(a), mask=upd.view(np.uint8))
         cv2.accumulateWeighted(dn.astype(np.float32), self._occ_dn, float(a), mask=upd.view(np.uint8))
-        self.scenery = self._occ_up > c.scenery_occ
-        absorb = ((self._occ_up > c.absorb_occ) | (self._occ_dn > c.absorb_occ)) & valid & upd
+        # Scenery (masked, not learnt): anything persistently there up to cat height,
+        # e.g. a kettle left out. Not people: their pixels are far above that.
+        rel = self._ref - depth.astype(np.float32)
+        self.scenery = (self._occ_up > c.scenery_occ) & valid & (rel <= c.max_height_mm) & (rel >= -self._lim)
+        absorb = ((self._occ_up > c.absorb_occ) | (self._occ_dn > c.absorb_occ)) & drift_ok & upd
         n = int(np.count_nonzero(absorb))
         if n:
             self.calib.baseline[absorb] = depth[absorb]
@@ -256,6 +270,13 @@ class DepthDetector:
             self._occ_dn[absorb] = 0
             self.adapted_px += n
             self._thr_key = None   # baseline changed -> threshold map depends on it
+
+    @property
+    def reference(self) -> np.ndarray:
+        """Calibrated empty-counter depth (not the adapted one)."""
+        if self._ref_id == id(self.calib.baseline) and self._ref is not None:
+            return self._ref
+        return self.calib.baseline
 
     def is_cat_sized(self, b: Blob) -> bool:
         c = self.cfg
