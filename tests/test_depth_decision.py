@@ -87,7 +87,7 @@ def test_static_object_fades_into_background(det):
     while t < 30:
         t += 1 / 15
         blobs = d.detect(frame, now=t)
-    assert blobs == []                               # gone after ~30 s
+    assert blobs == []                               # masked as scenery after ~30 s
     # ...and something new elsewhere is still detected straight away
     new = with_box(frame, 400, 380, 120, 70, 250)
     d.detect(new, now=t + 0.067)                     # temporal median needs it in 2 of 3 frames
@@ -303,3 +303,48 @@ def test_trigger_count_persists_and_survives_offline_broker(tmp_path):
     assert b.triggers_today == 0 and json.loads(f.read_text())["count"] == 0
     f.write_text(json.dumps({"date": "2020-01-01", "count": 9}))
     assert HaBridge(MqttCfg(), lambda n, p: None, counter_file=f).triggers_today == 0
+
+
+def test_person_sitting_still_is_not_absorbed_then_triggered():
+    """Overnight bug: someone sits/stands still for minutes with their head in front
+    of the counter; the background learnt them, then small movements of head/hands
+    showed up as moving cat-sized blobs. Must stay quiet."""
+    cfg = Config()
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
+    rgb = np.zeros((H, W, 3), np.uint8)
+    rng = np.random.default_rng(5)
+    trig = []
+    for i in range(15 * 5):                               # empty kitchen first
+        pipe.process(i / 15 - 5, rgb, front_scene())
+    for i in range(15 * 180):                             # 3 minutes
+        d = front_scene()
+        d[330:480, 190:370] = 0                    # torso too close for the Kinect: no depth
+        lean = int(120 * np.sin(i / 15 / 3))       # leaning forward/back +-12 cm
+        sway = int(8 * np.sin(i / 15 / 2.3)) + int(rng.integers(-2, 3))
+        d[215:335, 240 + sway:350 + sway] = COUNTER_MM - 700 - lean     # head/shoulders
+        if 15 * 60 < i < 15 * 120 and (i // 20) % 2:                     # arm reaching out
+            d[270:320, 340 + sway:420] = COUNTER_MM - 550
+        trig.append(pipe.process(i / 15, rgb, d).trigger)
+    assert sum(trig) == 0, f"{sum(trig)} triggers"
+    # and the cat is still caught afterwards
+    t0 = 180.0
+    for i in range(15 * 5):                               # person leaves, room settles
+        pipe.process(t0 + i / 15, rgb, front_scene())
+    t0 += 5
+    fired = [pipe.process(t0 + i / 15, rgb, with_box(front_scene(), 420, 235, 110, 70, 250)).trigger
+             for i in range(15)]
+    assert any(fired)
+
+
+def test_camera_cat_box_on_a_person_is_vetoed():
+    from catguard.app import person_in_box
+    ref = front_scene().astype(np.float32)
+    box = (240, 180, 110, 150)
+    empty_now = front_scene()
+    assert not person_in_box(empty_now, ref, box, 600)              # cat-height stuff only: keep
+    cat = with_box(front_scene(), 250, 240, 90, 60, 250)
+    assert not person_in_box(cat, ref, box, 600)                     # a real cat: keep
+    person = front_scene(); person[180:330, 240:350] = COUNTER_MM - 1000
+    assert person_in_box(person, ref, box, 600)                      # head/shoulders: veto
+    blind = np.zeros_like(ref, dtype=np.uint16)
+    assert not person_in_box(blind, ref, box, 600)                   # no depth: can't veto

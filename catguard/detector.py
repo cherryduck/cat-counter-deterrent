@@ -7,6 +7,7 @@ import numpy as np
 from .config import DetectorCfg
 
 COCO_CAT = 15
+COCO_PERSON = 0
 
 
 def brightness(rgb: np.ndarray) -> float:
@@ -56,6 +57,20 @@ class CatDetector:
         # require cat to be the top class for that anchor
         top_cls = cls.argmax(axis=0)
         cat = np.where(top_cls == COCO_CAT, cat, 0.0)
+        # ignore "cats" that are mostly inside a detected person (hair, fluffy
+        # dressing gowns): seen as cat=0.62 on someone's head
+        pers = np.nonzero((top_cls == COCO_PERSON) & (cls[COCO_PERSON] >= self.cfg.person_conf))[0]
+        cand = np.nonzero(cat >= 0.1)[0]
+        if pers.size and cand.size:
+            def xyxy(idx):
+                cx, cy, w, h = out[0, idx], out[1, idx], out[2, idx], out[3, idx]
+                return cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+            cx0, cy0, cx1, cy1 = (v[:, None] for v in xyxy(cand))
+            px0, py0, px1, py1 = (v[None, :] for v in xyxy(pers))
+            iw = np.clip(np.minimum(cx1, px1) - np.maximum(cx0, px0), 0, None)
+            ih = np.clip(np.minimum(cy1, py1) - np.maximum(cy0, py0), 0, None)
+            inside = (iw * ih) / np.maximum(1e-6, (cx1 - cx0) * (cy1 - cy0))
+            cat[cand[(inside >= 0.6).any(axis=1)]] = 0.0
         i = int(cat.argmax())
         score = float(cat[i])
         if score <= 0:
