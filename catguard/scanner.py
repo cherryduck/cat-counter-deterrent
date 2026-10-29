@@ -12,8 +12,13 @@ log = logging.getLogger(__name__)
 
 
 class ScanWorker:
-    def __init__(self, detector, confirm_scans: int = 2, strong_conf: float = 0.6):
+    def __init__(self, detector, confirm_scans: int = 2, strong_conf: float = 0.6,
+                 person_detector=None, person_conf: float = 0.4):
         self.detector = detector
+        self.person_detector = person_detector
+        self.person_conf = person_conf
+        self.person: tuple = (-1e9, 0.0, [])     # (frame time last seen, score, boxes)
+        self.person_ms = 0.0
         self.confirm_scans = max(1, confirm_scans)
         self.strong_conf = strong_conf
         self._frame: tuple | None = None
@@ -59,6 +64,15 @@ class ScanWorker:
                 log.exception("scan failed")
                 on, score, box = False, 0.0, None
             self.scan_ms = (time.perf_counter() - t) * 1e3
+            if self.person_detector is not None:
+                t2 = time.perf_counter()
+                try:
+                    ps, boxes = self.person_detector.persons(rgb, self.person_conf)
+                    if boxes:
+                        self.person = (t_frame, ps, boxes)
+                except Exception:
+                    log.exception("person check failed")
+                self.person_ms = (time.perf_counter() - t2) * 1e3
             self._streak = self._streak + 1 if on else 0
             hit = on and (self._streak >= self.confirm_scans or score >= self.strong_conf)
             # age is measured from when the frame was captured, not when the scan finished
