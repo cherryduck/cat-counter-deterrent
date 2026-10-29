@@ -3,6 +3,7 @@ name = "catguard"
 version = "0.1.0"
 description = "Kinect + Pi 5 cat-on-counter deterrent with Home Assistant integration"
 requires-python = ">=3.11"
+license = "MIT"
 dependencies = [
     "numpy",
     "opencv-python-headless",
