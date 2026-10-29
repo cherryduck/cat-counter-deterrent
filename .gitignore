@@ -4,8 +4,10 @@ __pycache__/
 .venv/
 calibration/
 recordings/
-models/*.onnx
-sounds/*.wav
+models/
+# your own deterrent recordings (any format) - never committed
+sounds/
 config.toml
 deploy/nas/mosquitto/config/passwd
 .secrets/
+catguard.egg-info/

@@ -1,7 +1,0 @@
-numpy
-opencv-python-headless
-onnxruntime
-paho-mqtt>=2.0
-
-[test]
-pytest
