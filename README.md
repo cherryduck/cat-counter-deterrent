@@ -95,7 +95,7 @@ In the commands below, replace:
 
 ```sh
 sudo apt install git python3-venv libfreenect-dev freenect libusb-1.0-0-dev alsa-utils
-git clone <this repo> ~/catguard && cd ~/catguard
+git clone https://github.com/cherryduck/cat-counter-deterrent.git ~/catguard && cd ~/catguard
 sudo cp deploy/pi/51-kinect.rules /etc/udev/rules.d/
 sudo cp deploy/pi/blacklist-gspca-kinect.conf /etc/modprobe.d/
 sudo modprobe -r gspca_kinect; sudo udevadm control --reload; sudo udevadm trigger
