@@ -61,6 +61,16 @@ class DetectorCfg:
     scan_confirm: int = 2           # consecutive positive scans needed...
     scan_strong_conf: float = 0.6   # ...unless a single scan is at least this confident
     roi_feet_margin_px: int = 25    # ROI grown by this much for the "feet on counter" test
+    # people (lit only): full-frame person check with the fast model
+    person_model: str = "models/yolov8n.onnx"
+    person_imgsz: int = 320
+    person_gate_conf: float = 0.4   # measured: people 0.76-0.93, cats <= 0.20
+    person_recent_s: float = 5.0    # no depth triggers while a person was seen this recently
+    # camera hits must agree with depth where depth is valid
+    camera_depth_recent_s: float = 10.0   # a depth candidate overlapped the box this recently...
+    camera_new_frac: float = 0.35         # ...or this share of the box is above the calibrated counter
+    light_jump: float = 25.0        # counter brightness change (0-255) within 1 s = light switched
+    light_settle_s: float = 3.0     # no depth triggers for this long after a light switch
 
 
 @dataclass

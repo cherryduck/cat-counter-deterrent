@@ -80,6 +80,19 @@ class CatDetector:
         by = int((cy - h / 2 - top) / r)
         return score, (bx, by, int(w / r), int(h / r))
 
+    def persons(self, rgb: np.ndarray, conf: float) -> tuple[float, list[tuple[int, int, int, int]]]:
+        """Full-frame person check: (best score, boxes >= conf) in image pixels."""
+        x, r, left, top = self._prep(rgb)
+        out = self.sess.run(None, {self.inp: x})[0][0]
+        cls = out[4:]
+        p = np.where(cls.argmax(axis=0) == COCO_PERSON, cls[COCO_PERSON], 0.0)
+        idx = np.nonzero(p >= conf)[0]
+        boxes = []
+        for i in idx[np.argsort(-p[idx])][:10]:
+            cx, cy, w, h = out[:4, i]
+            boxes.append((int((cx - w / 2 - left) / r), int((cy - h / 2 - top) / r), int(w / r), int(h / r)))
+        return float(p.max()) if p.size else 0.0, boxes
+
     def confirm(self, rgb: np.ndarray, bbox) -> tuple[bool, float]:
         x0, y0, w, h = crop_box(bbox, rgb.shape, self.cfg.crop_margin)
         crop = rgb[y0:y0 + h, x0:x0 + w]

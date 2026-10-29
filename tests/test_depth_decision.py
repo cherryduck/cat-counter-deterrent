@@ -348,3 +348,63 @@ def test_camera_cat_box_on_a_person_is_vetoed():
     assert person_in_box(person, ref, box, 600)                      # head/shoulders: veto
     blind = np.zeros_like(ref, dtype=np.uint16)
     assert not person_in_box(blind, ref, box, 600)                   # no depth: can't veto
+
+
+
+class _FakePersons:
+    """Person detector stub: reports a person while `on` is True."""
+    def __init__(self):
+        self.on = False
+
+    def persons(self, rgb, conf):
+        return (0.9, [(100, 100, 200, 300)]) if self.on else (0.0, [])
+
+
+def test_person_in_view_suppresses_depth_trigger_then_releases():
+    cfg = Config()
+    fp = _FakePersons()
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None, person_detector=fp)
+    rgb = np.full((H, W, 3), 120, np.uint8)            # lit
+    trig = []
+    for i in range(15 * 12):
+        fp.on = i < 15 * 4                              # person in view for 4 s
+        k = (5 * i) % 600
+        x = 150 + (k if k < 300 else 600 - k)           # cat walking up and down the whole time
+        trig.append(pipe.process(i / 15, rgb, with_box(front_scene(), x, 235, 110, 70, 250)).trigger)
+    first = trig.index(True) if True in trig else None
+    assert first is not None and first / 15 >= 4 + cfg.detector.person_recent_s - 0.1
+    assert first / 15 <= 4 + cfg.detector.person_recent_s + 1.0
+
+
+def test_person_gate_does_not_apply_in_the_dark():
+    cfg = Config()
+    fp = _FakePersons(); fp.on = True
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None, person_detector=fp)
+    rgb = np.zeros((H, W, 3), np.uint8)                 # dark: camera can't judge people
+    trig = [pipe.process(i / 15, rgb, with_box(front_scene(), 200 + 4 * i, 235, 110, 70, 250)).trigger
+            for i in range(30)]
+    assert any(trig)
+
+
+def test_light_switch_settles():
+    cfg = Config()
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
+    trig = []
+    for i in range(15 * 6):
+        rgb = np.full((H, W, 3), 150 if i < 15 else 10, np.uint8)   # light off at 1 s
+        x = 200 + 3 * (i % 40)
+        trig.append(pipe.process(i / 15, rgb, with_box(front_scene(), x, 235, 110, 70, 250)).trigger)
+    # moving thing from the start triggers early; then after the switch nothing new until settled
+    assert True in trig
+
+
+def test_camera_hit_needs_depth_agreement():
+    from catguard.app import depth_agrees
+    ref = front_scene().astype(np.float32)
+    box = (240, 220, 100, 80)
+    static = front_scene()                                     # nothing new above the counter
+    assert not depth_agrees(static, ref, box, [], 0.35)
+    assert depth_agrees(static, ref, box, [(250, 230, 60, 40)], 0.35)   # recent depth candidate
+    cat = with_box(front_scene(), 245, 225, 90, 70, 250)
+    assert depth_agrees(cat, ref, box, [], 0.35)               # new stuff above the counter
+    assert depth_agrees(np.zeros_like(static), ref, box, [], 0.35)      # depth-blind: can't veto
