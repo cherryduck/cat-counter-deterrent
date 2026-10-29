@@ -510,3 +510,9 @@ Defaults from `catguard/config.py`. `config.toml` only needs the ones you change
 - `sync_get_depth/video` return views onto libfreenect's internal buffers; copy them before keeping frames.
 - Never set the tilt at start-up. It silently changes the view and invalidates the calibration. The service only reads the angle; moving it marks the calibration stale.
 - Only one program can use the Kinect at a time: stop the service before `check`, `calibrate` or `record`.
+
+---
+
+## Licence
+
+MIT: see [LICENSE](LICENSE). The YOLO models you export are covered by [Ultralytics' own licence](https://www.ultralytics.com/license) (AGPL-3.0 unless you have an enterprise licence), separately from this code.
