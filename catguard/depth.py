@@ -378,6 +378,19 @@ class MotionGate:
         self._last_person = -1e9
         self._tracks: list[dict] = []                              # {mask, last, arrival, n}
         self._seen: np.ndarray | None = None                       # last time each pixel was in a candidate
+        # "Uncovered" ground: someone right beside the Kinect (too close for depth, a sliver
+        # for YOLO) casts a big depth hole; when they step away whatever was in it reappears
+        # as a "new" blob. Measured (filtered depth): such a reveal returns ~6% of the frame within 1 s; real
+        # cats (incl. sunlit ones walking out of dropout) <= 1.3%.
+        self._blind: np.ndarray | None = None      # when each pixel was last marked uncovered
+        self._inv_since: np.ndarray | None = None  # start of each pixel's current dropout run
+        self._ret_t: np.ndarray | None = None      # when each pixel last returned from a long run
+        self._returns: deque[tuple[float, int]] = deque()
+        self.blind_run_s = 1.0      # a dropout this long counts (short flicker doesn't)
+        self.reveal_frac = 0.03     # share of the frame returning within reveal_window_s
+        self.reveal_window_s = 1.0
+        self.blind_s = 3.0          # uncovered pixels aren't "known empty" for this long
+        self.blind_frac = 0.3       # blob share of uncovered pixels that voids "arrived"
         self.footprint_s = 30.0
         self.arrive_frames = 4
         self.min_moves = 3          # movement must be seen in >= this many checks...
@@ -417,11 +430,31 @@ class MotionGate:
         if self._seen is None or self._seen.shape != depth.shape:
             self._seen = np.full(depth.shape, -1e9, np.float64)
             self._terr_seen = np.full(depth.shape, -1e9, np.float64)
+            self._blind = np.full(depth.shape, -1e9, np.float64)
+            self._inv_since = np.full(depth.shape, -1e9, np.float64)
+            self._ret_t = np.full(depth.shape, -1e9, np.float64)
+            self._returns.clear()
+        inv = depth == 0
+        back = ~inv & (self._inv_since > -1e8)
+        ret = back & (now - self._inv_since >= self.blind_run_s)
+        self._inv_since[back] = -1e9
+        self._inv_since[inv & (self._inv_since < -1e8)] = now
+        n_ret = int(np.count_nonzero(ret))
+        if n_ret:
+            self._ret_t[ret] = now
+            self._returns.append((now, n_ret))
+        while self._returns and now - self._returns[0][0] > self.reveal_window_s:
+            self._returns.popleft()
+        if sum(n for _, n in self._returns) >= self.reveal_frac * depth.size:
+            self._blind[(now - self._ret_t) <= self.reveal_window_s] = now
+        blind = (now - self._blind) < self.blind_s
         while self._terr_pending and now - self._terr_pending[0][0] >= self.territory_delay_s:
             t, m = self._terr_pending.popleft()
             self._terr_seen[m] = t
         recent_area = (now - self._terr_seen) <= self.territory_mem_s
         known = cv2.dilate(recent_area.view(np.uint8), self._terr_kernel).view(bool) if recent_area.any() else None
+        if known is not None:
+            known = known | blind       # just-uncovered ground isn't "new ground" either
         for b in cands:
             why = ""
             # --- arrival: a new blob with no person around = it got there by itself.
@@ -436,7 +469,10 @@ class MotionGate:
                 self._tracks.append(tr)
             tr["n"] += 1
             if tr["arrival"] and tr["n"] == self.arrive_frames:
-                why = "arrived"
+                # checked now, not at birth: the reveal is only recognisable once enough
+                # of the hole has come back (the filtered depth returns gradually)
+                if np.mean(blind[b.mask]) < self.blind_frac:
+                    why = "arrived"
             tr["mask"], tr["last"] = b.mask, now
             # --- movement vs `lag` frames ago
             if old is not None and not why:

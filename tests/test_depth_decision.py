@@ -408,3 +408,40 @@ def test_camera_hit_needs_depth_agreement():
     cat = with_box(front_scene(), 245, 225, 90, 70, 250)
     assert depth_agrees(cat, ref, box, [], 0.35)               # new stuff above the counter
     assert depth_agrees(np.zeros_like(static), ref, box, [], 0.35)      # depth-blind: can't veto
+
+
+def test_object_uncovered_from_depth_shadow_does_not_trigger():
+    """2026-11-03 21:39:52: someone right beside the Kinect (too close for depth, only a
+    sliver for YOLO) shadows the hob. When they step away a pan reappears as a "new" blob
+    with no person blob around - it must not count as a cat arriving."""
+    cfg = Config()
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
+    rgb = np.zeros((H, W, 3), np.uint8)
+    trig = []
+    for i in range(90):
+        d = with_box(front_scene(), 300, 235, 130, 75, 300)        # pan, there all along
+        if i < 35:
+            d[:, 280:] = 0                                         # IR shadow of the person
+        elif i < 45:
+            d[:, 280 + 30 * (i - 34):] = 0                         # ...receding as she moves
+        trig.append(pipe.process(i * 0.067, rgb, d).trigger)
+    assert not any(trig), trig.index(True)
+
+
+def test_cat_jumping_up_through_flickering_dropouts_still_triggers():
+    """Sunlight makes depth drop out in short bursts; that must not hide a real arrival."""
+    cfg = Config()
+    pipe = Pipeline(cfg, Calibration(build_baseline([front_scene()]), FRONT), detector=None)
+    rgb = np.zeros((H, W, 3), np.uint8)
+    rng = np.random.default_rng(5)
+    fired_at = None
+    for i in range(40):
+        d = front_scene()
+        if i >= 3:
+            d = with_box(d, 240, 235, 130, 75, 250)
+        flick = np.zeros((H, W), bool)
+        flick[220:320, 200:400] = rng.random((100, 200)) < 0.10    # brief, scattered dropouts
+        d[flick] = 0
+        if pipe.process(i * 0.067, rgb, d).trigger and fired_at is None:
+            fired_at = i
+    assert fired_at is not None and (fired_at - 3) * 0.067 < 0.5
