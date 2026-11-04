@@ -391,6 +391,8 @@ class MotionGate:
         self.reveal_window_s = 1.0
         self.blind_s = 3.0          # uncovered pixels aren't "known empty" for this long
         self.blind_frac = 0.3       # blob share of uncovered pixels that voids "arrived"
+        self._bs = 4                # tracked at 1/4 resolution: the mask only needs to be coarse
+        self._last_reveal = -1e9
         self.footprint_s = 30.0
         self.arrive_frames = 4
         self.min_moves = 3          # movement must be seen in >= this many checks...
@@ -412,6 +414,30 @@ class MotionGate:
         prev = [o for o in others if np.count_nonzero(o.mask & b.mask) >= 0.3 * min(o.pixels, b.pixels)]
         return max(prev, key=lambda o: np.count_nonzero(o.mask & b.mask)) if prev else None
 
+    def _uncovered(self, depth: np.ndarray, now: float) -> np.ndarray | None:
+        """Full-res mask of ground uncovered by a reveal in the last blind_s, or None."""
+        since = self._inv_since
+        assert since is not None and self._ret_t is not None and self._blind is not None
+        inv = depth[::self._bs, ::self._bs] == 0
+        back = ~inv & (since > -1e8)
+        ret = back & (now - since >= self.blind_run_s)
+        since[back] = -1e9
+        since[inv & (since < -1e8)] = now
+        n_ret = int(np.count_nonzero(ret))
+        if n_ret:
+            self._ret_t[ret] = now
+            self._returns.append((now, n_ret))
+        while self._returns and now - self._returns[0][0] > self.reveal_window_s:
+            self._returns.popleft()
+        if self._returns and sum(n for _, n in self._returns) >= self.reveal_frac * inv.size:
+            self._blind[(now - self._ret_t) <= self.reveal_window_s] = now
+            self._last_reveal = now
+        if now - self._last_reveal >= self.blind_s:
+            return None
+        small = ((now - self._blind) < self.blind_s).view(np.uint8)
+        full = cv2.resize(small, (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST)
+        return full.view(bool)
+
     def update(self, depth: np.ndarray, cands: list[Blob], now: float,
                person_masks: list[np.ndarray] = ()) -> list[bool]:
         """Return, for each candidate, whether it's animate."""
@@ -430,30 +456,19 @@ class MotionGate:
         if self._seen is None or self._seen.shape != depth.shape:
             self._seen = np.full(depth.shape, -1e9, np.float64)
             self._terr_seen = np.full(depth.shape, -1e9, np.float64)
-            self._blind = np.full(depth.shape, -1e9, np.float64)
-            self._inv_since = np.full(depth.shape, -1e9, np.float64)
-            self._ret_t = np.full(depth.shape, -1e9, np.float64)
+            s = depth[::self._bs, ::self._bs].shape
+            self._blind = np.full(s, -1e9, np.float64)
+            self._inv_since = np.full(s, -1e9, np.float64)
+            self._ret_t = np.full(s, -1e9, np.float64)
             self._returns.clear()
-        inv = depth == 0
-        back = ~inv & (self._inv_since > -1e8)
-        ret = back & (now - self._inv_since >= self.blind_run_s)
-        self._inv_since[back] = -1e9
-        self._inv_since[inv & (self._inv_since < -1e8)] = now
-        n_ret = int(np.count_nonzero(ret))
-        if n_ret:
-            self._ret_t[ret] = now
-            self._returns.append((now, n_ret))
-        while self._returns and now - self._returns[0][0] > self.reveal_window_s:
-            self._returns.popleft()
-        if sum(n for _, n in self._returns) >= self.reveal_frac * depth.size:
-            self._blind[(now - self._ret_t) <= self.reveal_window_s] = now
-        blind = (now - self._blind) < self.blind_s
+            self._last_reveal = -1e9
+        blind = self._uncovered(depth, now)
         while self._terr_pending and now - self._terr_pending[0][0] >= self.territory_delay_s:
             t, m = self._terr_pending.popleft()
             self._terr_seen[m] = t
         recent_area = (now - self._terr_seen) <= self.territory_mem_s
         known = cv2.dilate(recent_area.view(np.uint8), self._terr_kernel).view(bool) if recent_area.any() else None
-        if known is not None:
+        if known is not None and blind is not None:
             known = known | blind       # just-uncovered ground isn't "new ground" either
         for b in cands:
             why = ""
@@ -471,7 +486,7 @@ class MotionGate:
             if tr["arrival"] and tr["n"] == self.arrive_frames:
                 # checked now, not at birth: the reveal is only recognisable once enough
                 # of the hole has come back (the filtered depth returns gradually)
-                if np.mean(blind[b.mask]) < self.blind_frac:
+                if blind is None or np.mean(blind[b.mask]) < self.blind_frac:
                     why = "arrived"
             tr["mask"], tr["last"] = b.mask, now
             # --- movement vs `lag` frames ago
