@@ -445,3 +445,16 @@ def test_cat_jumping_up_through_flickering_dropouts_still_triggers():
         if pipe.process(i * 0.067, rgb, d).trigger and fired_at is None:
             fired_at = i
     assert fired_at is not None and (fired_at - 3) * 0.067 < 0.5
+
+
+def test_replay_from_live_background_keeps_calibration_as_reference():
+    """`replay --live-baseline`: start from the learnt background, but camera checks and the
+    drift limit must still refer to the calibration, as in the live service."""
+    calib = Calibration(build_baseline([front_scene()]), FRONT)
+    cal_copy = calib.baseline.copy()
+    pipe = Pipeline(Config(), calib, detector=None)
+    learnt = cal_copy - 50                                   # background drifted 50 mm
+    pipe.depth.start_from_background(learnt)
+    pipe.process(0.0, np.zeros((H, W, 3), np.uint8), front_scene())
+    assert np.array_equal(pipe.depth.reference, cal_copy)
+    assert np.allclose(pipe.calib.baseline[calib.roi], learnt[calib.roi], atol=60)

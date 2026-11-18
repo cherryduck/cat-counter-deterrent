@@ -127,14 +127,14 @@ def cmd_replay(cfg, args):
     from .storage import annotate
     calib_dir = Path(args.calibration) if args.calibration else cfg.path(cfg.storage.calibration_dir)
     calib = Calibration.load(calib_dir)
+    from .app import load_person_detector
+    pipe = Pipeline(cfg, calib, None if args.no_model else load_detector(cfg), warmup_s=args.warmup,
+                    person_detector=None if args.no_model else load_person_detector(cfg, threads=4))
     if args.live_baseline and str(args.dir).endswith(".raw.npz"):
         z = np.load(args.dir)
         if "baseline" in z:
             print("using the live (adapted) baseline saved with the event")
-            calib.baseline = z["baseline"].astype(np.float32)
-    from .app import load_person_detector
-    pipe = Pipeline(cfg, calib, None if args.no_model else load_detector(cfg), warmup_s=args.warmup,
-                    person_detector=None if args.no_model else load_person_detector(cfg, threads=4))
+            pipe.depth.start_from_background(z["baseline"].astype(np.float32))
     src = open_source(args.dir)
     vw = None
     n = trig = cand_frames = hit_frames = 0

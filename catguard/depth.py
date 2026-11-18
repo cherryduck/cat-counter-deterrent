@@ -156,6 +156,26 @@ class DepthDetector:
     def reset_static(self):
         self._static_since, self._static_ref = None, None
 
+    def _set_reference(self, ref: np.ndarray):
+        """The calibrated empty counter: drift limit for learning, and what camera hits are checked against."""
+        c = self.cfg
+        self._ref, self._ref_id = ref, id(self.calib.baseline)
+        lim = np.maximum(c.adapt_max_mm, c.adapt_max_steps * 2.85e-6 * ref ** 2)
+        u16 = lambda x: np.clip(x, 1, 65535).astype(np.uint16)   # lower bound >= 1: excludes dropouts
+        self._drift_lo, self._drift_hi = u16(ref - lim), u16(ref + lim)
+        self._scen_lo = u16(ref - c.max_height_mm)    # scenery: up to cat height above the counter
+        bad = ref <= 0
+        for arr in (self._drift_lo, self._scen_lo):
+            arr[bad] = 65535                         # no reference -> never in range
+
+    def start_from_background(self, background: np.ndarray):
+        """Replay: start from the background the service had learnt, as the live service
+        was at the time - the calibration stays the reference (drift limit, camera checks)."""
+        ref = self.calib.baseline.copy()
+        self.calib.baseline[...] = background         # in place: same array, so not "a new calibration"
+        self._set_reference(ref)
+        self._thr_key = None
+
     def height_map(self, depth: np.ndarray) -> np.ndarray:
         d = depth.astype(np.float32)
         b = self.calib.baseline
@@ -254,15 +274,7 @@ class DepthDetector:
         # 1-4 steps; a person (>= ~0.5 m closer) never qualifies, so someone sitting
         # still can't be absorbed and then show up as cat-sized pieces when they move.
         if self._ref_id != id(self.calib.baseline):        # new calibration
-            ref = self.calib.baseline.copy()
-            self._ref, self._ref_id = ref, id(self.calib.baseline)
-            lim = np.maximum(c.adapt_max_mm, c.adapt_max_steps * 2.85e-6 * ref ** 2)
-            u16 = lambda x: np.clip(x, 1, 65535).astype(np.uint16)   # lower bound >= 1: excludes dropouts
-            self._drift_lo, self._drift_hi = u16(ref - lim), u16(ref + lim)
-            self._scen_lo = u16(ref - c.max_height_mm)    # scenery: up to cat height above the counter
-            bad = ref <= 0
-            for arr in (self._drift_lo, self._scen_lo):
-                arr[bad] = 65535                         # no reference -> never in range
+            self._set_reference(self.calib.baseline.copy())
         drift_ok = cv2.inRange(depth, self._drift_lo, self._drift_hi)       # uint8 0/255
         scen_ok = cv2.inRange(depth, self._scen_lo, self._drift_hi)
         dn = ((h <= -thr) & (depth > 0)).view(np.uint8)
