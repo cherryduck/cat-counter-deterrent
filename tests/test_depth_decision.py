@@ -575,3 +575,18 @@ def test_confirmed_spot_is_forgotten_once_the_cat_leaves():
         if pipe.process(t, _lit(), d).trigger:
             fired.append(t)
     assert fired and all(t < 5 for t in fired), fired
+
+
+def test_cleanup_keeps_trigger_raws_longer_than_near_miss_raws(tmp_path):
+    import os, time
+    from catguard.storage import EventStore
+    day = tmp_path / "2026-01-01"; day.mkdir()
+    now = time.time()
+    ages = {"100000_cat.raw.npz": 20, "100001_dry.raw.npz": 20, "100002_cand.raw.npz": 20,
+            "100003_cand.raw.npz": 3, "100004_cat.raw.npz": 40, "100005_cat.jpg": 20, "100006_cat.jpg": 40}
+    for name, days in ages.items():
+        p = day / name; p.write_bytes(b"x")
+        os.utime(p, (now - days * 86400, now - days * 86400))
+    EventStore(tmp_path, tmp_path / "fb", 15, 3, 3, 30, True, 7, 30).cleanup(now)
+    assert sorted(p.name for p in day.iterdir()) == [
+        "100000_cat.raw.npz", "100001_dry.raw.npz", "100003_cand.raw.npz", "100005_cat.jpg"]

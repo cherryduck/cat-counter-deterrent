@@ -292,7 +292,8 @@ Events are saved in one folder per day under `[storage] events_dir`, named by ti
 | `HHMMSS_dry.jpg` / `_cat.jpg` | Snapshot of a trigger, in dry run / with sound | 30 days |
 | `HHMMSS_*.mp4` | 3 s before and 3 s after, with boxes drawn on | 30 days |
 | `HHMMSS_cand.*` | A near miss | 30 days |
-| `HHMMSS_*.raw.npz` | Raw colour, depth and the background at the time, for replay (10–30 MB) | 7 days |
+| `HHMMSS_dry.raw.npz` / `_cat.raw.npz` | Raw colour, depth and the background at the time, for replay (10–30 MB) | 30 days |
+| `HHMMSS_cand.raw.npz` | The same for a near miss | 7 days |
 
 ### The aiming page (http://\<pi\>:8080)
 
@@ -500,7 +501,7 @@ Defaults from `catguard/config.py`. `config.toml` only needs the ones you change
 | `audio` | `device`, `sounds_dir`, `volume` | `default`, `sounds`, 1.0 | Output and software gain. |
 | `mqtt` | `enabled`, `host`, `port`, `username`, `password`, `base_topic`, `discovery_prefix` | | Broker. Always set `host`: the built-in default is the original author's address. |
 | `storage` | `events_dir`, `fallback_dir`, `calibration_dir` | `/mnt/catcam`, `~/catguard-events`, `calibration` | Where files go. |
-| | `retention_days`, `raw_retention_days` | 30, 7 | Clean-up. |
+| | `retention_days`, `raw_retention_days`, `trigger_raw_retention_days` | 30, 7, 30 | Clean-up: snapshots and clips; near-miss raws; trigger raws. |
 | | `pre_seconds`, `post_seconds` | 3, 3 | Clip length. |
 | | `save_raw`, `save_near_misses` | true, true | Raw recordings; near misses. |
 | `web` | `enabled`, `port` | true, 8080 | Aiming page. |

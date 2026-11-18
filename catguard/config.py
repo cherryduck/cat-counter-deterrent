@@ -108,7 +108,8 @@ class StorageCfg:
     pre_seconds: float = 3.0
     post_seconds: float = 3.0
     save_raw: bool = True             # raw RGB+depth per event for replay tuning (~10-20 MB each)
-    raw_retention_days: int = 7
+    raw_retention_days: int = 7               # near-miss (_cand) raws
+    trigger_raw_retention_days: int = 30      # trigger (_cat/_dry) raws: kept to re-check real cats
     save_near_misses: bool = True     # record cat-sized blobs that didn't trigger (for tuning)
 
 

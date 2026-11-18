@@ -39,7 +39,8 @@ def annotate(rgb: np.ndarray, blobs, label: str, cat_box=None) -> np.ndarray:
 
 class EventStore:
     def __init__(self, primary: Path, fallback: Path, fps: float, pre_s: float, post_s: float,
-                 retention_days: int, save_raw: bool = False, raw_retention_days: int = 7):
+                 retention_days: int, save_raw: bool = False, raw_retention_days: int = 7,
+                 trigger_raw_retention_days: int = 30):
         self.primary, self.fallback = primary, fallback
         self.fps = fps
         self.ring: deque[np.ndarray] = deque(maxlen=max(1, int(pre_s * fps)))
@@ -49,7 +50,8 @@ class EventStore:
         self._last_cleanup = 0.0
         # raw RGB+depth for offline replay/tuning (catguard replay <file>.raw.npz)
         self.save_raw = save_raw
-        self.raw_retention_days = raw_retention_days
+        self.raw_retention_days = raw_retention_days                  # near misses
+        self.trigger_raw_retention_days = trigger_raw_retention_days  # _cat / _dry
         self.raw_ring: deque[tuple[float, np.ndarray, np.ndarray]] = deque(maxlen=max(1, int(pre_s * fps)))
         self._raw_pending: list[tuple[Path, list, int]] = []
         self.baseline_fn = None    # set by the service: current (adapted) baseline, saved with raw events
@@ -129,15 +131,23 @@ class EventStore:
         except Exception:
             log.exception("could not write clip %s", path)
 
-    def cleanup(self):
-        cutoff = time.time() - self.retention_days * 86400
-        raw_cutoff = time.time() - self.raw_retention_days * 86400
+    def _cutoff(self, name: str, now: float) -> float:
+        if not name.endswith(".raw.npz"):
+            days = self.retention_days
+        elif name.endswith("_cand.raw.npz"):
+            days = self.raw_retention_days
+        else:
+            days = self.trigger_raw_retention_days
+        return now - days * 86400
+
+    def cleanup(self, now: float | None = None):
+        now = time.time() if now is None else now
         for root in {self.primary, self.fallback}:
             if not root.exists():
                 continue
             for p in root.glob("*/*"):
                 try:
-                    if p.stat().st_mtime < (raw_cutoff if p.name.endswith(".raw.npz") else cutoff):
+                    if p.stat().st_mtime < self._cutoff(p.name, now):
                         p.unlink()
                 except OSError:
                     pass

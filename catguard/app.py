@@ -342,7 +342,7 @@ class Service:
         self.store = EventStore(Path(cfg.storage.events_dir), Path(cfg.storage.fallback_dir).expanduser(),
                                 cfg.capture.fps, cfg.storage.pre_seconds, cfg.storage.post_seconds,
                                 cfg.storage.retention_days, cfg.storage.save_raw,
-                                cfg.storage.raw_retention_days)
+                                cfg.storage.raw_retention_days, cfg.storage.trigger_raw_retention_days)
         self.store.baseline_fn = lambda: self.calib.baseline
         self.enabled = True
         self.dry_run = dry_run
