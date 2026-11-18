@@ -16,7 +16,8 @@ import numpy as np
 from .capture import open_source
 from .config import Config
 from .decision import Decider
-from .depth import Blob, Calibration, DepthDetector, MotionGate, build_baseline, build_noise
+from .depth import (Blob, Calibration, DepthDetector, MotionGate, build_baseline, build_noise,
+                    load_live_state, save_live_state)
 from .detector import brightness
 
 
@@ -422,6 +423,20 @@ class Service:
             self.scanner = ScanWorker(det, person_detector=load_person_detector(cfg, threads=cfg.detector.scan_threads),
                                       person_conf=cfg.detector.person_gate_conf)
         self.pipe = Pipeline(cfg, self.calib, det, self.scanner, warmup_s=cfg.depth.warmup_s)
+        # learnt background from before a restart: without it everything put on the counter
+        # since calibration looks new again until relearnt (false trigger 2026-11-18 19:45:02)
+        self._fingerprint = self.calib.fingerprint()
+        self._state_file = self.calib_dir / "live_state.npz"
+        self._state_saved = time.monotonic()
+        self._state_thread = None
+        st, why = load_live_state(self._state_file, self._fingerprint, self.calib.baseline.shape,
+                                  cfg.storage.live_state_max_age_s)
+        if st is not None:
+            self.pipe.depth.import_state(st)
+            log.info("restored learnt background (%s); warm-up %.0f s", why, cfg.depth.warmup_s)
+        else:
+            self.pipe.warmup_s = cfg.depth.cold_warmup_s
+            log.info("starting from the calibration (%s); warm-up %.0f s", why, cfg.depth.cold_warmup_s)
         self.player = Player(cfg.path(cfg.audio.sounds_dir), cfg.audio.device, cfg.audio.volume)
         self.store = EventStore(Path(cfg.storage.events_dir), Path(cfg.storage.fallback_dir).expanduser(),
                                 cfg.capture.fps, cfg.storage.pre_seconds, cfg.storage.post_seconds,
@@ -485,6 +500,7 @@ class Service:
             elif name == "roi":
                 self.calib.set_polygon(arg)
                 self.calib.save(self.calib_dir)
+                self._fingerprint = self.calib.fingerprint()
             elif name == "recalibrate":
                 recal = True
             elif name == "test_sound":
@@ -523,6 +539,32 @@ class Service:
         self.ha.state("cooldown", int(self.pipe.decider.cfg.cooldown_s))
         self.ha.state("volume", int(round(self.player.volume * 100)))
         self.ha.state("night_mode", self.pipe.night_mode)
+
+    def save_state(self, wait: bool = False) -> bool:
+        """Save the learnt background (copied here, written in a thread unless `wait`)."""
+        st = self.pipe.depth.export_state()
+        if st is None:
+            return False
+        if self._state_thread is not None and self._state_thread.is_alive():
+            if not wait:
+                return False                # previous write still going (slow SD card)
+            self._state_thread.join()
+        fp, path = self._fingerprint, self._state_file
+
+        def write() -> bool:
+            try:
+                save_live_state(path, st, fp)
+                return True
+            except Exception:
+                log.exception("could not save learnt background")
+                return False
+        if wait:
+            return write()
+        else:
+            import threading
+            self._state_thread = threading.Thread(target=write, daemon=True, name="state")
+            self._state_thread.start()
+        return True
 
     def stop(self, *_):
         self._running = False
@@ -572,6 +614,7 @@ class Service:
                     self.calib.baseline = base
                     self.calib.noise = noise
                     self.calib.save(self.calib_dir)
+                    self._fingerprint = self.calib.fingerprint()
                     cv2.imwrite(str(self.calib_dir / "snapshot.jpg"), cv2.cvtColor(snap, cv2.COLOR_RGB2BGR))
                     self.pipe.depth.reset_static()
                     self.calib_stale = False
@@ -637,15 +680,22 @@ class Service:
                     if self.ha:
                         self.ha.roll_day()
                     el = time.monotonic() - stats_t
-                    log.info("stats: %.1f fps, %.0f ms/frame, scan %.0f+%.0f ms, %s, blobs=%d, person %.0fs ago, gated=%d",
+                    log.info("stats: %.1f fps, %.0f ms/frame, scan %.0f+%.0f ms, %s, blobs=%d, person %.0fs ago, gated=%d, "
+                             "camera vetoes depth=%d static=%d",
                              stats_n / el, proc_ms / stats_n,
                              self.scanner.scan_ms if self.scanner else 0,
                              self.scanner.person_ms if self.scanner else 0, v.label(), len(v.blobs),
-                             min(9999, time.monotonic() - self.pipe._person[0]), self.pipe.gated_frames)
+                             min(9999, time.monotonic() - self.pipe._person[0]), self.pipe.gated_frames,
+                             self.pipe.camera_vetoes, self.pipe.static_vetoes)
                     stats_t, stats_n, proc_ms = time.monotonic(), 0, 0.0
+                if time.monotonic() - self._state_saved >= self.cfg.storage.live_state_every_s:
+                    self._state_saved = time.monotonic()
+                    self.save_state()
                 if dt < period:
                     time.sleep(period - dt)
         finally:
+            if self.save_state(wait=True):
+                log.info("saved learnt background to %s", self._state_file)
             if self.scanner:
                 self.scanner.stop()
             if self.web:

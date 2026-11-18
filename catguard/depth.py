@@ -7,7 +7,9 @@ inside the counter ROI is a candidate blob.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -101,6 +103,40 @@ def temporal_median(frames: list[np.ndarray]) -> np.ndarray:
     return out
 
 
+def save_live_state(path: Path, state: dict, fingerprint: str, now: float | None = None):
+    """Atomically write the learnt background (temp file + rename: survives power loss)."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        np.savez_compressed(fh, fingerprint=np.array(fingerprint), saved_at=np.array(
+            time.time() if now is None else now), **state)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def load_live_state(path: Path, fingerprint: str, shape, max_age_s: float,
+                    now: float | None = None) -> tuple[dict | None, str]:
+    """(state, why) - state is None if missing, stale, unreadable or from another calibration."""
+    path = Path(path)
+    if not path.exists():
+        return None, "no saved state"
+    try:
+        with np.load(path) as z:
+            if str(z["fingerprint"]) != fingerprint:
+                return None, "saved for a different calibration"
+            age = (time.time() if now is None else now) - float(z["saved_at"])
+            if not 0 <= age <= max_age_s:
+                return None, f"saved {age:.0f} s ago (limit {max_age_s:.0f} s)"
+            st = {k: z[k] for k in ("baseline", "occ_up", "occ_dn", "scenery") if k in z}
+    except Exception as e:                                   # truncated / corrupt file
+        return None, f"unreadable ({e.__class__.__name__})"
+    if any(k not in st for k in ("baseline", "occ_up", "occ_dn")) or any(
+            v.shape != tuple(shape) for v in st.values()):
+        return None, "incomplete or wrong size"
+    return st, f"saved {age:.0f} s ago"
+
+
 class Calibration:
     """Baseline depth + per-pixel noise + ROI polygon, persisted in calibration_dir."""
 
@@ -125,6 +161,13 @@ class Calibration:
         if (d / "roi.json").exists():
             poly = json.loads((d / "roi.json").read_text())["polygon"]
         return cls(baseline, poly, noise)
+
+    def fingerprint(self) -> str:
+        """Identifies this calibration (baseline + outline). Take it before any frames are
+        processed: the adaptive background is learnt into `baseline` in place."""
+        h = hashlib.sha1(np.ascontiguousarray(self.baseline, np.float32).tobytes())
+        h.update(json.dumps(self.polygon).encode())
+        return h.hexdigest()[:16]
 
     def set_polygon(self, polygon):
         self.polygon = polygon
@@ -167,6 +210,24 @@ class DepthDetector:
         bad = ref <= 0
         for arr in (self._drift_lo, self._scen_lo):
             arr[bad] = 65535                         # no reference -> never in range
+
+    def export_state(self) -> dict | None:
+        """The learnt background (adapted baseline, occupancy, scenery) - copies, cheap."""
+        if self._occ_up is None or self._occ_dn is None or self._ref is None:
+            return None
+        st = {"baseline": self.calib.baseline.copy(), "occ_up": self._occ_up.copy(),
+              "occ_dn": self._occ_dn.copy()}
+        if self.scenery is not None:
+            st["scenery"] = self.scenery.copy()
+        return st
+
+    def import_state(self, st: dict):
+        """Continue from an exported state. Call before any frame is processed."""
+        self.start_from_background(st["baseline"].astype(np.float32))
+        self._occ_up = st["occ_up"].astype(np.float32).copy()
+        self._occ_dn = st["occ_dn"].astype(np.float32).copy()
+        if "scenery" in st:
+            self.scenery = st["scenery"].astype(bool).copy()
 
     def start_from_background(self, background: np.ndarray):
         """Replay: start from the background the service had learnt, as the live service

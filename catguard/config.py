@@ -27,7 +27,8 @@ class DepthCfg:
     temporal_frames: int = 3        # per-pixel median over this many frames (kills flicker)
     noise_k: float = 4.0            # per-pixel threshold = max(min_height, noise_k * sigma)
     quant_k: float = 3.0            # ...and >= quant_k Kinect depth steps (2.85e-6*z^2 mm)
-    warmup_s: float = 5.0           # no depth triggers for this long after start
+    warmup_s: float = 5.0           # no depth triggers for this long after start (learnt state restored)
+    cold_warmup_s: float = 20.0     # ...or this long when starting from the calibration alone
     adapt_tau_s: float = 8.0        # background learning time constant (0 = off)
     scenery_occ: float = 0.5        # occupancy above which a pixel is treated as background
     adapt_every: int = 3            # update the background every N frames (cost)
@@ -116,6 +117,8 @@ class StorageCfg:
     raw_retention_days: int = 7               # near-miss (_cand) raws
     trigger_raw_retention_days: int = 30      # trigger (_cat/_dry) raws: kept to re-check real cats
     save_near_misses: bool = True     # record cat-sized blobs that didn't trigger (for tuning)
+    live_state_every_s: float = 300.0     # save the learnt background this often (and on stop)...
+    live_state_max_age_s: float = 3600.0  # ...and restore it on start if it's no older than this
 
 
 @dataclass
