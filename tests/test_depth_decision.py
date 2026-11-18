@@ -458,3 +458,120 @@ def test_replay_from_live_background_keeps_calibration_as_reference():
     pipe.process(0.0, np.zeros((H, W, 3), np.uint8), front_scene())
     assert np.array_equal(pipe.depth.reference, cal_copy)
     assert np.allclose(pipe.calib.baseline[calib.roi], learnt[calib.roi], atol=60)
+
+# --- camera false positive 2026-11-16 18:35: YOLO "cat" on something left in the sink ---
+
+class _FlakyDetector(FakeDetector):
+    """Positive on every other scan only, never two in a row (YOLO flickering on a still object)."""
+    def scan(self, rgb, region, roi):
+        on, sc, box = super().scan(rgb, region, roi)
+        return (on, sc, box) if self.scans % 2 else (False, 0.0, None)
+
+
+def _lit_front_pipe(detector):
+    return Pipeline(Config(), Calibration(build_baseline([front_scene()]), FRONT), detector=detector)
+
+
+def test_lone_strong_scan_needs_depth_support_where_depth_can_see():
+    """Small item (below cat size, so no depth candidate) inside the YOLO box, depth valid."""
+    pipe = _lit_front_pipe(_FlakyDetector(feet=(310, 295), score=0.9))
+    item = with_box(front_scene(), 285, 245, 50, 40, 150)
+    assert not any(pipe.process(i / 15, _lit(), item).trigger for i in range(30))
+
+
+def test_lone_strong_scan_still_counts_when_depth_blind():
+    """Sunlight: no depth in the box, so a single confident scan is all there is."""
+    pipe = _lit_front_pipe(_FlakyDetector(feet=(310, 295), score=0.9))
+    blind = np.zeros((H, W), np.uint16)
+    assert [pipe.process(i / 15, _lit(), blind).trigger for i in range(30)].count(True) == 1
+
+
+def test_lone_strong_scan_counts_with_a_depth_candidate():
+    pipe = _lit_front_pipe(_FlakyDetector(feet=(305, 305), score=0.9))
+    cat = with_box(front_scene(), 240, 235, 130, 75, 250)          # cat-sized, sitting still
+    assert any(pipe.process(i / 15, _lit(), cat).trigger for i in range(30))
+
+
+def test_camera_ignores_object_left_out_long_enough_to_be_scenery():
+    det = FakeDetector(feet=None, score=0.5)                         # streak path, not the strong bypass
+    pipe = _lit_front_pipe(det)
+    trig = []
+    for i in range(15 * 75):
+        d = with_box(front_scene(), 250, 230, 120, 70, 200)          # put down by hand, then left
+        if i < 10:
+            d[300:480, 150:500] = 900
+        if i == 15 * 60:
+            det.feet = (310, 295)                                     # a minute later YOLO calls it a cat
+        trig.append(pipe.process(i / 15, _lit(), d).trigger)
+    assert not any(trig)
+
+
+def test_camera_keeps_retriggering_on_a_cat_that_sits_still():
+    """The scenery exclusion must not lose a real cat once it stops moving."""
+    det = FakeDetector(feet=(305, 305), score=0.5)
+    pipe = _lit_front_pipe(det)
+    fired = []
+    for i in range(15 * 100):
+        d = front_scene()
+        if i < 3:
+            d[290:380, 260:340] = 1300                                # jumping up
+        else:
+            d = with_box(d, 240, 235, 130, 75, 250)                   # then sits still
+        if pipe.process(i / 15, _lit(), d).trigger:
+            fired.append(i / 15)
+    assert len(fired) == 3 and fired[-1] > 2 * pipe.decider.cfg.cooldown_s
+
+
+def test_depth_agrees_ignores_scenery():
+    from catguard.app import depth_agrees
+    ref = front_scene().astype(np.float32)
+    box = (240, 220, 100, 80)
+    obj = with_box(front_scene(), 245, 225, 90, 70, 250)
+    scen = np.zeros((H, W), bool); scen[225:295, 245:335] = True
+    assert depth_agrees(obj, ref, box, [], 0.35)                    # new: agrees
+    assert not depth_agrees(obj, ref, box, [], 0.35, scen)           # been sitting there: doesn't
+    assert depth_agrees(obj, ref, box, [(250, 230, 60, 40)], 0.35, scen)   # recent candidate still wins
+
+
+def test_camera_scan_does_not_run_in_the_dark():
+    det = FakeDetector(feet=(305, 305), score=0.9)
+    pipe = _lit_front_pipe(det)
+    dark = np.zeros((H, W, 3), np.uint8)
+    trig = [pipe.process(i / 15, dark, with_box(front_scene(), 200 + 4 * i, 235, 110, 70, 250)).trigger
+            for i in range(30)]
+    assert det.scans == 0 and any(trig)
+
+
+def test_still_cat_retriggers_after_camera_loses_it_for_a_while():
+    """YOLO misses a sitting cat for 20 s (it turned away), then sees it again."""
+    det = FakeDetector(feet=(305, 305), score=0.5)
+    pipe = _lit_front_pipe(det)
+    fired = []
+    for i in range(15 * 100):
+        d = front_scene()
+        if i < 3:
+            d[290:380, 260:340] = 1300
+        else:
+            d = with_box(d, 240, 235, 130, 75, 250)
+        det.feet = None if 15 * 10 <= i < 15 * 30 else (305, 305)
+        if pipe.process(i / 15, _lit(), d).trigger:
+            fired.append(i / 15)
+    assert len(fired) == 3, fired
+
+
+def test_confirmed_spot_is_forgotten_once_the_cat_leaves():
+    """Cat confirmed, leaves; a bag is then left on the same spot and YOLO calls it a cat."""
+    det = FakeDetector(feet=(305, 305), score=0.5)
+    pipe = _lit_front_pipe(det)
+    fired = []
+    for i in range(15 * 120):
+        t = i / 15
+        d = front_scene()
+        if t < 5:
+            d = with_box(d, 240 + 3 * i, 235, 130, 75, 250) if i < 30 else with_box(d, 330, 235, 130, 75, 250)
+        elif t >= 10:
+            d = with_box(d, 250, 230, 120, 70, 200)                   # bag left there from 10 s
+        det.feet = (305, 305) if (t < 5 or t >= 60) else None         # YOLO "cat" on the bag after 60 s
+        if pipe.process(t, _lit(), d).trigger:
+            fired.append(t)
+    assert fired and all(t < 5 for t in fired), fired

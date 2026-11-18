@@ -59,6 +59,10 @@ class Pipeline:
         self.person_detector = person_detector   # sync person check (replay); live uses the scanner
         self._person = (-1e9, 0.0, [])
         self._cand_hist: list[tuple[float, tuple]] = []   # (time, bbox) of recent depth candidates
+        # boxes of accepted camera hits, kept while something is still raised there: a cat
+        # confirmed once stays confirmable after it sits still long enough to become depth
+        # scenery (and if YOLO loses it for a while); dropped once it has gone
+        self._cam_confirmed: list[tuple] = []
         self._bright: list[tuple[float, float]] = []
         self._light_until = -1e9
         self.gate = ""
@@ -76,7 +80,7 @@ class Pipeline:
         self.night_mode = cfg.detector.night_mode
         self._n = 0
         self._t_start: float | None = None
-        self._last_scan = (False, 0.0, None)
+        self._last_scan = (False, 0.0, None, 0)   # on, score, box, streak
         self.camera_vetoes = 0
         self._roi_cache = None
 
@@ -133,28 +137,36 @@ class Pipeline:
         if not dark and self.detector is not None and c.detector.scan_every > 0:
             if self.scanner is not None:
                 self.scanner.submit(rgb, (rx, ry, rw, rh), feet_roi)
-                s_hit, score, s_box, s_rgb = self.scanner.latest()
+                s_on, score, s_box, s_rgb, s_streak = self.scanner.latest()
             else:
                 if self._n % c.detector.scan_every == 0:
                     on, sc, bx = self.detector.scan(rgb, (rx, ry, rw, rh), feet_roi)
                     self._streak = self._streak + 1 if on else 0
-                    d = c.detector
-                    self._last_scan = (on and (self._streak >= d.scan_confirm or sc >= d.scan_strong_conf),
-                                       sc, bx)
-                s_hit, score, s_box = self._last_scan
+                    self._last_scan = (on, sc, bx, self._streak)
+                s_on, score, s_box, s_streak = self._last_scan
                 s_rgb = None
+            recent_boxes = [bb for _, bb in self._cand_hist]
+            self._cam_confirmed = [bb for bb in self._cam_confirmed
+                                   if raised_frac(fd, self.depth.reference, bb) >= dc.camera_new_frac]
+            s_hit = s_on and s_box is not None and scan_confirmed(
+                s_streak, score, dc.scan_confirm, dc.scan_strong_conf,
+                lambda: depth_blind(fd, self.depth.reference, s_box)
+                or overlaps_candidate(s_box, recent_boxes))
             if s_hit and s_box is not None and person_in_box(fd, self.depth.reference, s_box,
                                                             c.depth.max_height_mm, persons):
                 s_hit = False
                 self.camera_vetoes += 1
             if s_hit and s_box is not None and not depth_agrees(
-                    fd, self.depth.reference, s_box, [bb for _, bb in self._cand_hist], dc.camera_new_frac):
+                    fd, self.depth.reference, s_box, recent_boxes + self._cam_confirmed,
+                    dc.camera_new_frac, self.depth.scenery):
                 s_hit = False                     # static object the camera mistakes for a cat
                 self.camera_vetoes += 1
             if s_hit and person_recent and (score < dc.scan_strong_conf or any(
                     _overlap(s_box, pb) > 0.3 for pb in self._person[2])):
                 s_hit = False                     # with people about, only a confident, separate cat
-            if s_hit:
+            if s_hit and s_box is not None:
+                self._cam_confirmed = [bb for bb in self._cam_confirmed
+                                       if not overlaps_candidate(s_box, [bb])] + [s_box]
                 cat_box, snap_rgb = s_box, s_rgb
                 reason = reason + "+camera" if reason else "camera"
         if self._t_start is None:
@@ -213,24 +225,68 @@ def _overlap(a, b) -> float:
     return iw * ih / max(1, aw * ah)
 
 
-def depth_agrees(depth: np.ndarray, ref: np.ndarray, box, recent_cand_boxes, new_frac: float) -> bool:
-    """Does depth back up a camera "cat"? Where depth is valid, either a depth
-    candidate overlapped the box recently, or enough of the box sits above the
-    calibrated empty counter (a static object that was there at calibration -
-    coffee machine in shadow - fails both). No valid depth (sunlight): can't judge."""
+def scan_confirmed(streak: int, score: float, confirm: int, strong_conf: float, strong_ok) -> bool:
+    """Does a positive counter scan count as a camera hit?
+
+    `confirm` positive scans in a row always do. A single scan at >= strong_conf
+    only does if `strong_ok()` - depth can't see the box (sunlight: the case the
+    camera path is for) or a depth candidate backs it. Where depth can see and
+    shows nothing arriving, one confident scan isn't enough: YOLO's score on a
+    still object can jump 0 -> 0.67 from frame to frame (dark item in the sink)."""
+    if streak >= max(1, confirm):
+        return True
+    return score >= strong_conf and bool(strong_ok())
+
+
+def _box_depth(depth: np.ndarray, ref: np.ndarray, box):
+    """(slice ys, slice xs, d, r, valid) for the box clipped to the frame, or None if empty."""
     H, W = depth.shape
     x, y, w, h = (int(v) for v in box)
     x0, y0, x1, y1 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
     if x1 <= x0 or y1 <= y0:
+        return None
+    ys, xs = slice(y0, y1), slice(x0, x1)
+    d = depth[ys, xs].astype(np.float32)
+    r = ref[ys, xs]
+    return ys, xs, d, r, (d > 0) & (r > 0)
+
+
+def depth_blind(depth: np.ndarray, ref: np.ndarray, box, min_valid: float = 0.2) -> bool:
+    """Too little valid depth in the box to judge it (sunlight, out of frame)."""
+    bd = _box_depth(depth, ref, box)
+    return bd is None or np.count_nonzero(bd[4]) < min_valid * bd[4].size
+
+
+def overlaps_candidate(box, recent_cand_boxes) -> bool:
+    return any(_overlap(box, cb) > 0.1 or _overlap(cb, box) > 0.3 for cb in recent_cand_boxes)
+
+
+def raised_frac(depth: np.ndarray, ref: np.ndarray, box) -> float:
+    """Share of the box's valid depth > 80 mm above the calibrated counter (0 if depth-blind)."""
+    bd = _box_depth(depth, ref, box)
+    if bd is None or depth_blind(depth, ref, box):
+        return 0.0
+    _, _, d, r, valid = bd
+    return float(np.mean(((r - d) > 80)[valid]))
+
+
+def depth_agrees(depth: np.ndarray, ref: np.ndarray, box, recent_cand_boxes, new_frac: float,
+                 scenery: np.ndarray | None = None) -> bool:
+    """Does depth back up a camera "cat"? Where depth is valid, either a depth
+    candidate overlapped the box recently, or enough of the box sits above the
+    calibrated empty counter and isn't scenery (a static object - coffee machine
+    in shadow, something left in the sink for hours - fails both). No valid
+    depth (sunlight): can't judge."""
+    bd = _box_depth(depth, ref, box)
+    if bd is None or depth_blind(depth, ref, box):
         return True
-    d = depth[y0:y1, x0:x1].astype(np.float32)
-    r = ref[y0:y1, x0:x1]
-    valid = (d > 0) & (r > 0)
-    if np.count_nonzero(valid) < 0.2 * valid.size:
+    if overlaps_candidate(box, recent_cand_boxes):
         return True
-    if any(_overlap(box, cb) > 0.1 or _overlap(cb, box) > 0.3 for cb in recent_cand_boxes):
-        return True
-    return float(np.mean((r - d)[valid] > 80)) >= new_frac
+    ys, xs, d, r, valid = bd
+    new = (r - d) > 80
+    if scenery is not None:
+        new &= ~scenery[ys, xs]          # been sitting there: the background, not a new arrival
+    return float(np.mean(new[valid])) >= new_frac
 
 
 def load_person_detector(cfg: Config, threads: int = 1):
@@ -279,8 +335,7 @@ class Service:
         self.scanner = None
         if det is not None and cfg.detector.scan_every > 0:
             from .scanner import ScanWorker
-            self.scanner = ScanWorker(det, cfg.detector.scan_confirm, cfg.detector.scan_strong_conf,
-                                      person_detector=load_person_detector(cfg, threads=cfg.detector.scan_threads),
+            self.scanner = ScanWorker(det, person_detector=load_person_detector(cfg, threads=cfg.detector.scan_threads),
                                       person_conf=cfg.detector.person_gate_conf)
         self.pipe = Pipeline(cfg, self.calib, det, self.scanner, warmup_s=cfg.depth.warmup_s)
         self.player = Player(cfg.path(cfg.audio.sounds_dir), cfg.audio.device, cfg.audio.volume)
