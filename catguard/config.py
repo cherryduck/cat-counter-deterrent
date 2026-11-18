@@ -69,6 +69,13 @@ class DetectorCfg:
     # camera hits must agree with depth where depth is valid
     camera_depth_recent_s: float = 10.0   # a depth candidate overlapped the box this recently...
     camera_new_frac: float = 0.35         # ...or this share of the box is above the calibrated counter
+    # camera hits where the calibration has no depth (edge strips, hob): no depth veto exists,
+    # so the box must look different from its recent background (edge structure, not brightness)
+    blind_calib_frac: float = 0.4         # box counts as permanently blind below this calibrated-valid share
+                                          # (knife block boxes 0.10-0.21; 29 Oct sunlit cat 0.66-0.70)
+    blind_static_ncc: float = 0.8         # structure correlation with the background at/above this = static
+    blind_bg_tau_s: float = 60.0          # background learning time constant
+    blind_hold_s: float = 30.0            # background frozen where YOLO saw a cat this recently
     light_jump: float = 25.0        # counter brightness change (0-255) within 1 s = light switched
     light_settle_s: float = 3.0     # no depth triggers for this long after a light switch
 

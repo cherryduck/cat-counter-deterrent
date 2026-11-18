@@ -19,6 +19,67 @@ from .decision import Decider
 from .depth import Blob, Calibration, DepthDetector, MotionGate, build_baseline, build_noise
 from .detector import brightness
 
+
+def _structure(gray: np.ndarray) -> np.ndarray:
+    """Edge structure (gradient magnitude): stable under slow light changes, unlike brightness."""
+    g = cv2.GaussianBlur(gray.astype(np.float32), (3, 3), 0)
+    return cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
+
+
+class StructureBackground:
+    """Slow background of the counter's RGB edge structure, for camera hits where depth can't judge.
+
+    A static object YOLO mistakes for a cat (knife block in a depth-blind strip) matches its own
+    background (measured 0.93-0.98 normalised correlation, hours apart in different light); a cat
+    arriving doesn't (0.46-0.56). Learning is frozen where YOLO has recently seen a cat, so a cat
+    that sits still keeps looking different and keeps re-triggering.
+    """
+
+    def __init__(self, tau_s: float, every: int = 3):
+        self.tau_s, self.every = tau_s, max(1, every)
+        self.bg: np.ndarray | None = None
+        self.region: tuple | None = None
+        self._n, self._dt, self._last = 0, 0.0, None
+
+    def _crop(self, rgb: np.ndarray, region) -> np.ndarray:
+        x, y, w, h = region
+        return _structure(cv2.cvtColor(rgb[y:y + h, x:x + w], cv2.COLOR_RGB2GRAY))
+
+    def update(self, rgb: np.ndarray, region, now: float, frozen_boxes=(), reset: bool = False):
+        if self._last is not None:
+            self._dt += max(0.0, now - self._last)
+        self._last = now
+        self._n += 1
+        if self.bg is not None and not reset and self.region == region and self._n % self.every:
+            return
+        g = self._crop(rgb, region)
+        if self.bg is None or reset or self.region != region or self.tau_s <= 0:
+            self.bg, self.region, self._dt = g, region, 0.0
+            return
+        a = float(min(1.0, self._dt / self.tau_s))
+        self._dt = 0.0
+        mask = np.full(g.shape, 255, np.uint8)
+        rx, ry = region[0], region[1]
+        for bx, by, bw, bh in frozen_boxes:
+            mask[max(0, by - ry):max(0, by - ry + bh), max(0, bx - rx):max(0, bx - rx + bw)] = 0
+        cv2.accumulateWeighted(g, self.bg, a, mask=mask)
+
+    def similarity(self, rgb: np.ndarray, box) -> float | None:
+        """Correlation of the box's structure with the background, or None if it can't be judged."""
+        if self.bg is None or self.region is None:
+            return None
+        rx, ry, rw, rh = self.region
+        x, y, w, h = (int(v) for v in box)
+        x0, y0 = max(x, rx) - rx, max(y, ry) - ry
+        x1, y1 = min(x + w, rx + rw) - rx, min(y + h, ry + rh) - ry
+        if x1 - x0 < 8 or y1 - y0 < 8 or (x1 - x0) * (y1 - y0) < 0.5 * w * h:
+            return None
+        a = self._crop(rgb, self.region)[y0:y1, x0:x1]
+        b = self.bg[y0:y1, x0:x1]
+        a, b = a - a.mean(), b - b.mean()
+        den = float(np.sqrt((a * a).sum() * (b * b).sum()))
+        return float((a * b).sum() / den) if den > 1e-6 else 1.0   # both flat: nothing new
+
 log = logging.getLogger("catguard")
 
 
@@ -63,6 +124,10 @@ class Pipeline:
         # confirmed once stays confirmable after it sits still long enough to become depth
         # scenery (and if YOLO loses it for a while); dropped once it has gone
         self._cam_confirmed: list[tuple] = []
+        dcfg = cfg.detector
+        self.structure = StructureBackground(dcfg.blind_bg_tau_s, cfg.depth.adapt_every)
+        self._blind_seen: list[tuple[float, tuple]] = []   # (time, box) YOLO saw a cat in a blind box
+        self.blind_vetoes = 0
         self._bright: list[tuple[float, float]] = []
         self._light_until = -1e9
         self.gate = ""
@@ -112,8 +177,13 @@ class Pipeline:
         dc = c.detector
         # light switched on/off: depth reads shift for a moment
         self._bright = [(t, b) for t, b in self._bright if now - t <= 1.0] + [(now, bright)]
-        if max(b for _, b in self._bright) - min(b for _, b in self._bright) >= dc.light_jump:
+        light_switched = max(b for _, b in self._bright) - min(b for _, b in self._bright) >= dc.light_jump
+        if light_switched:
             self._light_until = now + dc.light_settle_s
+        self._blind_seen = [(t, bb) for t, bb in self._blind_seen if now - t <= dc.blind_hold_s]
+        # relearn from scratch when the light switches: the old background is from other lighting
+        self.structure.update(rgb, (rx, ry, rw, rh), now, [bb for _, bb in self._blind_seen],
+                              reset=light_switched)
         # people (lit only; the camera can't see them in the dark)
         if self.scanner is not None:
             self._person = self.scanner.person
@@ -161,6 +231,14 @@ class Pipeline:
                     dc.camera_new_frac, self.depth.scenery):
                 s_hit = False                     # static object the camera mistakes for a cat
                 self.camera_vetoes += 1
+            if s_on and s_box is not None and calib_blind(self.depth.reference, s_box, dc.blind_calib_frac):
+                self._blind_seen = [(t, bb) for t, bb in self._blind_seen
+                                    if not overlaps_candidate(s_box, [bb])] + [(now, s_box)]
+                if s_hit:
+                    sim = self.structure.similarity(s_rgb if s_rgb is not None else rgb, s_box)
+                    if sim is not None and sim >= dc.blind_static_ncc:
+                        s_hit = False             # no depth here, and it looks like it always has
+                        self.blind_vetoes += 1
             if s_hit and person_recent and (score < dc.scan_strong_conf or any(
                     _overlap(s_box, pb) > 0.3 for pb in self._person[2])):
                 s_hit = False                     # with people about, only a confident, separate cat
@@ -255,6 +333,16 @@ def depth_blind(depth: np.ndarray, ref: np.ndarray, box, min_valid: float = 0.2)
     """Too little valid depth in the box to judge it (sunlight, out of frame)."""
     bd = _box_depth(depth, ref, box)
     return bd is None or np.count_nonzero(bd[4]) < min_valid * bd[4].size
+
+
+def calib_blind(ref: np.ndarray, box, min_valid: float) -> bool:
+    """The calibration has (almost) no depth in this box: depth can never vet a camera hit here."""
+    H, W = ref.shape
+    x, y, w, h = (int(v) for v in box)
+    x0, y0, x1, y1 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
+    if x1 <= x0 or y1 <= y0:
+        return False
+    return np.count_nonzero(ref[y0:y1, x0:x1] > 0) < min_valid * (x1 - x0) * (y1 - y0)
 
 
 def overlaps_candidate(box, recent_cand_boxes) -> bool:

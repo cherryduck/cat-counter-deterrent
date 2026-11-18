@@ -590,3 +590,77 @@ def test_cleanup_keeps_trigger_raws_longer_than_near_miss_raws(tmp_path):
     EventStore(tmp_path, tmp_path / "fb", 15, 3, 3, 30, True, 7, 30).cleanup(now)
     assert sorted(p.name for p in day.iterdir()) == [
         "100000_cat.raw.npz", "100001_dry.raw.npz", "100003_cand.raw.npz", "100005_cat.jpg"]
+
+
+# --- knife block false positives 2026-11-18: camera hits where the calibration has no depth ---
+
+_TEX = np.random.default_rng(7).integers(90, 230, (H, W, 3)).astype(np.uint8)
+_TEX = np.ascontiguousarray(np.repeat(np.repeat(_TEX[::8, ::8], 8, 0), 8, 1))   # blocky worktop texture
+
+
+def _blind_scene():
+    d = front_scene()
+    d[200:330, 460:540] = 0                    # right-edge strip the Kinect never sees
+    return d
+
+
+def _knife_rgb(gain=1.0, cat=False):
+    img = _TEX.copy()
+    img[262:318, 486:530] = 30                 # dark block...
+    img[262:318, 490:526:8] = 200              # ...with handles
+    if cat:
+        img[262:320, 474:534] = 45             # a cat in front of it: different outline
+        img[268:276, 480:528:6] = 170
+    return np.clip(img.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+
+
+def _blind_pipe(det):
+    return Pipeline(Config(), Calibration(build_baseline([_blind_scene()]), FRONT), detector=det)
+
+
+def test_static_object_in_depth_blind_strip_never_hits():
+    det = FakeDetector(feet=None, score=0.5)                         # YOLO "cat", streak path
+    pipe = _blind_pipe(det)
+    trig = []
+    for i in range(15 * 130):
+        if i == 15 * 70:
+            det.feet = (510, 320)                                     # box (470, 260, 80, 60)
+        trig.append(pipe.process(i / 15, _knife_rgb(), _blind_scene()).trigger)
+    assert not any(trig)
+
+
+def test_cat_arriving_in_depth_blind_strip_hits():
+    det = FakeDetector(feet=None, score=0.5)
+    pipe = _blind_pipe(det)
+    trig = []
+    for i in range(15 * 80):
+        cat = i >= 15 * 70
+        det.feet = (510, 320) if cat else None
+        trig.append(pipe.process(i / 15, _knife_rgb(cat=cat), _blind_scene()).trigger)
+    assert any(trig)
+
+
+def test_cat_sitting_still_in_depth_blind_strip_retriggers():
+    det = FakeDetector(feet=None, score=0.5)
+    pipe = _blind_pipe(det)
+    fired = []
+    for i in range(15 * 230):
+        cat = i >= 15 * 70
+        det.feet = (510, 320) if cat else None
+        if pipe.process(i / 15, _knife_rgb(cat=cat), _blind_scene()).trigger:
+            fired.append(i / 15)
+    assert len(fired) == 4, fired                                     # 70, 115, 160, 205 s
+
+
+def test_slow_light_change_over_static_object_in_blind_strip_never_hits():
+    det = FakeDetector(feet=(510, 320), score=0.5)
+    pipe = _blind_pipe(det)
+    trig = []
+    for i in range(15 * 180):
+        gain = 1.0 - 0.45 * min(1.0, i / (15 * 170))                  # afternoon dimming, no switch
+        if i < 15 * 70:
+            det.feet = None
+        else:
+            det.feet = (510, 320)
+        trig.append(pipe.process(i / 15, _knife_rgb(gain), _blind_scene()).trigger)
+    assert not any(trig)
