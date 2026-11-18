@@ -664,3 +664,76 @@ def test_slow_light_change_over_static_object_in_blind_strip_never_hits():
             det.feet = (510, 320)
         trig.append(pipe.process(i / 15, _knife_rgb(gain), _blind_scene()).trigger)
     assert not any(trig)
+
+
+# --- washing-up bowl false positive 2026-11-18 19:28: camera hit on a low object the background absorbed ---
+
+def _bowl_rgb(bowl=True, cat=False):
+    img = _TEX.copy()
+    if bowl:
+        img[248:290, 282:338] = 70                 # rim
+        img[252:286, 290:330] = 150                # inside
+    if cat:
+        img[240:296, 274:346] = 40                 # a cat: different outline
+        img[246:254, 280:340:7] = 180
+    return img
+
+
+def _bowl_depth(bowl=True, person=False, cat=False):
+    d = front_scene()
+    if bowl:
+        d = with_box(d, 285, 248, 50, 40, 110)     # 110 mm: within the 150 mm drift the background may absorb
+    if cat:
+        d = with_box(d, 275, 240, 70, 56, 250)
+    if person:
+        d[300:480, 150:500] = 900
+    return d
+
+
+def test_low_object_absorbed_by_background_is_not_a_cat():
+    """Bowl put down by someone; YOLO calls it a cat from 45 s later, steadily."""
+    det = FakeDetector(feet=None, score=0.5)
+    pipe = _lit_front_pipe(det)
+    trig = []
+    for i in range(15 * 150):
+        t = i / 15
+        det.feet = (310, 295) if t >= 50 else None
+        trig.append(pipe.process(t, _bowl_rgb(t >= 2), _bowl_depth(t >= 2, person=t < 5)).trigger)
+    assert not any(trig)
+
+
+def test_sunlit_cat_arriving_on_depth_visible_counter_still_hits():
+    """Calibration has depth here, but sun blinds it now: camera only."""
+    det = FakeDetector(feet=None, score=0.5)
+    pipe = _lit_front_pipe(det)
+    blind = np.zeros((H, W), np.uint16)
+    trig = []
+    for i in range(15 * 60):
+        cat = i >= 15 * 50
+        det.feet = (310, 295) if cat else None
+        trig.append(pipe.process(i / 15, _bowl_rgb(False, cat=cat), blind).trigger)
+    assert any(trig)
+
+
+def test_cat_sitting_still_on_textured_counter_keeps_retriggering():
+    """Like the flat-image still-cat test, but with real texture so the structure gate is exercised."""
+    det = FakeDetector(feet=None, score=0.5)
+    pipe = _lit_front_pipe(det)
+    fired = []
+    for i in range(15 * 230):
+        cat = i >= 15 * 70
+        det.feet = (310, 295) if cat else None
+        if pipe.process(i / 15, _bowl_rgb(False, cat=cat), _bowl_depth(False, cat=cat)).trigger:
+            fired.append(i / 15)
+    assert len(fired) == 4, fired                       # 70, 115, 160, 205 s
+
+
+def test_cat_on_featureless_background_is_not_called_static():
+    from catguard.app import StructureBackground
+    sb = StructureBackground(30.0, 1)
+    flat = np.full((H, W, 3), 250, np.uint8)            # washed out by sun
+    for i in range(60):
+        sb.update(flat, (100, 200, 440, 130), i / 15)
+    cat = flat.copy(); cat[240:296, 274:346] = 40; cat[246:254, 280:340:7] = 180
+    assert sb.similarity(cat, (270, 235, 80, 60)) < 0.8        # structure appeared: different
+    assert sb.similarity(flat, (270, 235, 80, 60)) is None      # nothing either way: can't judge
